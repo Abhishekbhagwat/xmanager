@@ -29,6 +29,10 @@ _apis = [
         alias="auth",
     ),
     _module_lazy_loader.XManagerAPI(
+        module="xmanager.cloud.launchers",
+        alias="launchers",
+    ),
+    _module_lazy_loader.XManagerAPI(
         module="xmanager.xm_local.executors",
         symbol="Caip",
     ),
@@ -71,6 +75,14 @@ _apis = [
     _module_lazy_loader.XManagerAPI(
         module="xmanager.xm_local.executors",
         symbol="VertexSpec",
+    ),
+    _module_lazy_loader.XManagerAPI(
+        module="xmanager.xm_local.executors",
+        symbol="VertexTrainingCluster",
+    ),
+    _module_lazy_loader.XManagerAPI(
+        module="xmanager.xm_local.executors",
+        symbol="VertexTrainingClusterSpec",
     ),
     _module_lazy_loader.XManagerAPI(
         module="xmanager.xm_local.experiment",
@@ -116,6 +128,7 @@ __getattr__ = _lazy_loader.get_module_getattr()
 if typing.TYPE_CHECKING:
   # pylint: disable=g-bad-import-order
   from xmanager.cloud import auth
+  from xmanager.cloud import launchers
   from xmanager.xm_local import experiment as _experiment
   from xmanager.xm_local import executors as _executors
 
@@ -130,6 +143,8 @@ if typing.TYPE_CHECKING:
   TpuCapability = _executors.TpuCapability
   Vertex = _executors.Vertex
   VertexSpec = _executors.VertexSpec
+  VertexTrainingCluster = _executors.VertexTrainingCluster
+  VertexTrainingClusterSpec = _executors.VertexTrainingClusterSpec
 
   create_experiment = _experiment.create_experiment
   get_experiment = _experiment.get_experiment

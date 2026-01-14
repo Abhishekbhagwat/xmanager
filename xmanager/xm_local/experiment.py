@@ -48,8 +48,10 @@ class _LaunchResult:
     return self.handles.get(local_executors.Local, [])
 
   def get_non_local_handles(self) -> list[execution_handles.ExecutionHandle]:
-    return self.handles.get(local_executors.Vertex, []) + self.handles.get(
-        local_executors.Kubernetes, []
+    return (
+        self.handles.get(local_executors.Vertex, [])
+        + self.handles.get(local_executors.Kubernetes, [])
+        + self.handles.get(local_executors.VertexTrainingCluster, [])
     )
 
 
@@ -434,6 +436,13 @@ def get_experiment(experiment_id: int) -> xm.Experiment:
         )
         assert handle
         kubernetes_jobs = handle.kubernetes_jobs
+        non_local_handles = [handle]
+      elif data.HasField('vertex_training_cluster'):
+        vertex_training_cluster_jobs = []
+        handle = registry.get_create_handle_method(
+            local_executors.VertexTrainingCluster
+        )(data=data, vertex_training_cluster_jobs=vertex_training_cluster_jobs)
+        assert handle
         non_local_handles = [handle]
     work_unit._non_local_execution_handles = non_local_handles
     experiment._experiment_units.append(work_unit)

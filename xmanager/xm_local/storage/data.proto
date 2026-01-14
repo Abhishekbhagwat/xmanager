@@ -21,6 +21,7 @@ message Job {
     LocalJob local = 1;
     AIPlatformJob caip = 2;
     KubernetesJob kubernetes = 3;
+    VertexTrainingClusterJob vertex_training_cluster = 4;
   }
 }
 
@@ -43,4 +44,21 @@ message KubernetesJob {
   string namespace = 1;
   // Name of the kubernetes job.
   string job_name = 2;
+}
+
+message VertexTrainingClusterJob {
+  // The SLURM job ID for the training cluster job.
+  string slurm_job_id = 1;
+  // The login node for the training cluster.
+  string login_node = 2;
+  // The type of cluster.
+  string cluster_type = 3;
+  // The partition where the job is running.
+  string partition = 4;
+  // Whether to use gcloud compute ssh.
+  bool use_gcloud_ssh = 5;
+  // SSH hostname override for gcloud ssh.
+  string ssh_hostname = 6;
+  // Working directory on cluster.
+  string work_dir = 7;
 }

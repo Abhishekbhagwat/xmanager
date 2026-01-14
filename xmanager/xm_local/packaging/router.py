@@ -34,6 +34,10 @@ def _packaging_router(
           packageable,
           packageable.executable_spec,
       )
+    case executors.VertexTrainingClusterSpec():
+      return cloud_packaging.package_cloud_executable(
+          built_targets, packageable, packageable.executable_spec
+      )
     case executors.LocalSpec():
       return local_packaging.package_for_local_executor(
           built_targets,

@@ -20,6 +20,8 @@ from xmanager import xm
 class LocalWorkUnitStatusEnum(enum.Enum):
   """Status of a local experiment job."""
 
+  # Work unit was created, but has not started yet.
+  PENDING = 0
   # Work unit was created, but has not terminated yet.
   RUNNING = 1
   # Work unit terminated and was successful.
@@ -28,6 +30,8 @@ class LocalWorkUnitStatusEnum(enum.Enum):
   FAILED = 3
   # Work unit terminated because it was cancelled by the user.
   CANCELLED = 4
+  # Work unit status is unknown.
+  UNKNOWN = 5
 
 
 class LocalWorkUnitStatus(xm.ExperimentUnitStatus):

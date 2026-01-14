@@ -293,6 +293,45 @@ class Database:
         job_data=data,
     )
 
+  def insert_vertex_training_cluster_job(
+      self,
+      experiment_id: int,
+      work_unit_id: int,
+      job_name: str,
+      slurm_job_id: str,
+      login_node: str,
+      cluster_type: str,
+      partition: str,
+      use_gcloud_ssh: bool = False,
+      ssh_hostname: str = "",
+      work_dir: str = "",
+  ) -> None:
+    """Insert a Vertex Training Cluster job into the database."""
+    job = data_pb2.Job(
+        vertex_training_cluster=data_pb2.VertexTrainingClusterJob(
+            slurm_job_id=slurm_job_id,
+            login_node=login_node,
+            cluster_type=cluster_type,
+            partition=partition,
+            use_gcloud_ssh=use_gcloud_ssh,
+            ssh_hostname=ssh_hostname,
+            work_dir=work_dir,
+        )
+    )
+    data = text_format.MessageToString(job)
+    query = text(
+        'INSERT INTO '
+        'job (experiment_id, work_unit_id, job_name, job_data) '
+        'VALUES (:experiment_id, :work_unit_id, :job_name, :job_data)'
+    )
+    self.engine.execute(
+        query,
+        experiment_id=experiment_id,
+        work_unit_id=work_unit_id,
+        job_name=job_name,
+        job_data=data,
+    )
+
   def list_experiment_ids(self) -> List[int]:
     """Lists all the experiment ids from local database."""
     query = text('SELECT experiment_id FROM experiment')

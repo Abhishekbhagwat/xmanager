@@ -33,6 +33,8 @@ def _get_push_image_tag(executor_spec: xm.ExecutorSpec) -> Optional[str]:
       return caip_spec.push_image_tag
     case local_executors.KubernetesSpec() as kubernetes_spec:
       return kubernetes_spec.push_image_tag
+    case local_executors.VertexTrainingClusterSpec() as vtc_spec:
+      return vtc_spec.push_image_tag
     case _:
       raise TypeError(
           f'Unsupported executor specification: {executor_spec!r}. '

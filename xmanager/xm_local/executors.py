@@ -15,7 +15,8 @@
 
 import importlib
 import logging
-from typing import Any, Dict, Optional, Sequence
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import attr
 from typing_extensions import override
@@ -171,6 +172,142 @@ class Kubernetes(xm.Executor):
   def __attrs_post_init__(self):
     k8s_execution = importlib.import_module('xmanager.cloud.kubernetes')
     k8s_execution.register()
+
+  @override
+  @classmethod
+  async def launch(
+      cls, local_experiment_unit: Any, job_group: xm.JobGroup
+  ) -> Sequence[handles.ExecutionHandle]:
+    return await registry.get_launch_method(cls)(
+        local_experiment_unit, job_group
+    )
+
+
+@attr.s(auto_attribs=True)
+class VertexTrainingClusterSpec(xm.ExecutorSpec):
+  """Vertex Training Cluster spec for packaging.
+
+  Attributes:
+    push_image_tag: Image registry path to push (for Docker packaging).
+    squashfs_path: Path to pre-built .squashfs on cluster storage.
+    auto_convert_to_squashfs: Convert Docker image to squashfs on cluster.
+  """
+
+  push_image_tag: Optional[str] = None
+  squashfs_path: Optional[str] = None
+  auto_convert_to_squashfs: bool = False
+
+
+@attr.s(auto_attribs=True)
+class VertexTrainingCluster(xm.Executor):
+  """Executor for Slurm-based Vertex Training Clusters.
+
+  This executor provides deep XManager integration:
+    - Generates sbatch scripts (or uses user-provided)
+    - Submits jobs via sbatch
+    - Tracks jobs via squeue/sacct
+    - Streams logs via SSH
+    - Integrates with experiment tracking
+
+  Submission Modes:
+    1. Raw Script: Provide complete sbatch script via `sbatch_script`
+    2. Template: Provide Jinja2 template via `sbatch_template`
+    3. Auto-Generate: Use `launcher` + cluster config to generate script
+
+  Supported cluster types:
+    - hcc-a3m: H100 GPUs with TCPXO networking
+    - hcc-a3u: H200 GPUs with gIB networking
+    - hcc-a4: B200 GPUs with gIB networking
+    - hcc-a3h: H100 GPUs with gIB networking
+
+  Example (Auto-Generate with NemoRunLauncher):
+    from xmanager.cloud import launchers
+
+    executor = xm_local.VertexTrainingCluster(
+        cluster_type='hcc-a4',
+        partition='a4',
+        requirements=xm.JobRequirements(replicas=4),
+        launcher=launchers.NemoRunLauncher(
+            recipe='pretrain/llama3p1_2b_pt.py',
+            container_image='nemo.sqsh',
+        ),
+    )
+
+  Example (Template):
+    executor = xm_local.VertexTrainingCluster(
+        cluster_type='hcc-a4',
+        sbatch_template=Path('my_template.j2'),
+    )
+
+  Example (Raw Script):
+    executor = xm_local.VertexTrainingCluster(
+        cluster_type='hcc-a4',
+        sbatch_script='#!/bin/bash\\n#SBATCH --nodes=2\\nsrun train.py',
+    )
+  """
+
+  requirements: xm.JobRequirements = attr.Factory(xm.JobRequirements)
+  # NOTE: Use requirements.replicas for node count (maps to --nodes)
+
+  # Cluster configuration
+  cluster_type: str = 'hcc-a3m'  # hcc-a3m, hcc-a3u, hcc-a4, hcc-a3h
+  partition: Optional[str] = None
+  account: Optional[str] = None
+  time_limit: str = "0"  # "0" = unlimited
+  exclusive: bool = True
+
+  # Submission mode 1: Raw sbatch script (complete script, no templating)
+  sbatch_script: Optional[str] = None
+
+  # Submission mode 2: Custom template (Jinja2 string or path)
+  sbatch_template: Optional[Union[str, Path]] = None
+
+  # Submission mode 3: Auto-generate (use launcher)
+  # Type is Any to avoid circular import; actual type is Launcher
+  launcher: Optional[Any] = None
+
+  # Additional sbatch flags (arbitrary --key=value pairs)
+  sbatch_flags: Dict[str, str] = attr.Factory(dict)
+
+  # Connection settings
+  use_gcloud_ssh: bool = False  # Use gcloud compute ssh
+  login_node: Optional[str] = None  # SSH target (omit if on login node)
+  ssh_hostname: Optional[str] = None  # Hostname for gcloud ssh -o Hostname=...
+
+  # Working directories on cluster
+  work_dir: Optional[str] = None
+  log_dir: Optional[str] = None  # Directory for slurm-*.out files
+
+  # Container configuration
+  container_image: Optional[str] = None  # .squashfs or docker image path
+  container_mounts: List[str] = attr.Factory(list)
+
+  # Environment configuration
+  env_vars: Dict[str, str] = attr.Factory(dict)
+
+  # Prologue/Epilogue commands
+  prologue_commands: List[str] = attr.Factory(list)
+  epilogue_commands: List[str] = attr.Factory(list)
+
+  # Log streaming
+  stream_output: bool = True
+
+  Spec = VertexTrainingClusterSpec  # pylint: disable=invalid-name
+
+  def __attrs_post_init__(self):
+    vertex_training_cluster_execution = importlib.import_module(
+        'xmanager.cloud.vertex_training_cluster'
+    )
+    vertex_training_cluster_execution.register()
+
+  def get_cluster_config(self):
+    """Get NCCL and networking configuration for this cluster type.
+
+    Returns:
+      ClusterConfig with nccl_dir, nccl_env_vars, setup_script, etc.
+    """
+    vtc = importlib.import_module('xmanager.cloud.vertex_training_cluster')
+    return vtc.get_cluster_config(self.cluster_type)
 
   @override
   @classmethod
