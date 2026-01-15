@@ -189,13 +189,9 @@ class VertexTrainingClusterSpec(xm.ExecutorSpec):
 
   Attributes:
     push_image_tag: Image registry path to push (for Docker packaging).
-    squashfs_path: Path to pre-built .squashfs on cluster storage.
-    auto_convert_to_squashfs: Convert Docker image to squashfs on cluster.
   """
 
   push_image_tag: Optional[str] = None
-  squashfs_path: Optional[str] = None
-  auto_convert_to_squashfs: bool = False
 
 
 @attr.s(auto_attribs=True)
@@ -203,16 +199,18 @@ class VertexTrainingCluster(xm.Executor):
   """Executor for Slurm-based Vertex Training Clusters.
 
   This executor provides deep XManager integration:
-    - Generates sbatch scripts (or uses user-provided)
+    - Rsyncs local files to cluster before submission
+    - Generates sbatch scripts with container/distributed training support
     - Submits jobs via sbatch
     - Tracks jobs via squeue/sacct
     - Streams logs via SSH
     - Integrates with experiment tracking
 
   Submission Modes:
-    1. Raw Script: Provide complete sbatch script via `sbatch_script`
-    2. Template: Provide Jinja2 template via `sbatch_template`
-    3. Auto-Generate: Use `launcher` + cluster config to generate script
+    1. Template (default): Auto-generates sbatch script using container_image,
+       job executable, and cluster config. Optionally provide custom template
+       via `sbatch_template`.
+    2. Raw Script: Provide complete sbatch script via `sbatch_script` (no templating)
 
   Supported cluster types:
     - hcc-a3m: H100 GPUs with TCPXO networking
@@ -220,23 +218,28 @@ class VertexTrainingCluster(xm.Executor):
     - hcc-a4: B200 GPUs with gIB networking
     - hcc-a3h: H100 GPUs with gIB networking
 
-  Example (Auto-Generate with NemoRunLauncher):
-    from xmanager.cloud import launchers
+  Example (JAX/MaxText):
+    executor = xm_local.VertexTrainingCluster(
+        cluster_type='hcc-a4',
+        partition='a4',
+        requirements=xm.JobRequirements(replicas=32),
+        container_image='/path/to/jax-maxtext.sqsh',
+        container_mounts=['/data:/data', '/gcs:/gcs'],
+        setup_jax_coordinator=True,  # Export JAX_COORDINATOR_ADDRESS
+        local_files=['./configs/'],  # Rsync to work_dir
+        work_dir='/mnt/jobs/my_experiment',
+    )
 
+  Example (PyTorch/NeMo):
     executor = xm_local.VertexTrainingCluster(
         cluster_type='hcc-a4',
         partition='a4',
         requirements=xm.JobRequirements(replicas=4),
-        launcher=launchers.NemoRunLauncher(
-            recipe='pretrain/llama3p1_2b_pt.py',
-            container_image='nemo.sqsh',
-        ),
-    )
-
-  Example (Template):
-    executor = xm_local.VertexTrainingCluster(
-        cluster_type='hcc-a4',
-        sbatch_template=Path('my_template.j2'),
+        container_image='/path/to/nemo.sqsh',
+        container_mounts=['/logs:/mnt/logs'],
+        use_mpi=True,  # Add --mpi=pmix for PyTorch
+        local_files=['./recipes/', './scripts/'],
+        work_dir='/mnt/workspace',
     )
 
   Example (Raw Script):
@@ -259,12 +262,11 @@ class VertexTrainingCluster(xm.Executor):
   # Submission mode 1: Raw sbatch script (complete script, no templating)
   sbatch_script: Optional[str] = None
 
-  # Submission mode 2: Custom template (Jinja2 string or path)
+  # Submission mode 2: Custom Jinja2 template (string or path)
   sbatch_template: Optional[Union[str, Path]] = None
 
-  # Submission mode 3: Auto-generate (use launcher)
-  # Type is Any to avoid circular import; actual type is Launcher
-  launcher: Optional[Any] = None
+  # If neither sbatch_script nor sbatch_template is set, uses default template
+  # with container_image and job executable to generate the script
 
   # Additional sbatch flags (arbitrary --key=value pairs)
   sbatch_flags: Dict[str, str] = attr.Factory(dict)
@@ -278,9 +280,19 @@ class VertexTrainingCluster(xm.Executor):
   work_dir: Optional[str] = None
   log_dir: Optional[str] = None  # Directory for slurm-*.out files
 
+  # Local files to rsync to work_dir before job submission
+  # Paths can be files or directories, relative or absolute
+  local_files: List[str] = attr.Factory(list)
+
   # Container configuration
   container_image: Optional[str] = None  # .squashfs or docker image path
   container_mounts: List[str] = attr.Factory(list)
+  use_mpi: bool = False  # Add --mpi=pmix to srun for PyTorch/NeMo
+  container_env_passthrough: List[str] = attr.Factory(list)  # Vars for --container-env
+
+  # Distributed training configuration
+  master_port: int = 29500  # Port for distributed training rendezvous
+  setup_jax_coordinator: bool = False  # Export JAX_COORDINATOR_ADDRESS for JAX distributed
 
   # Environment configuration
   env_vars: Dict[str, str] = attr.Factory(dict)

@@ -31,8 +31,8 @@ Supported cluster types:
 import asyncio
 import os
 import re
+import shutil
 import subprocess
-import tempfile
 from typing import Any, Dict, List, Optional
 
 import attr
@@ -188,20 +188,15 @@ class Client:
     else:
       return []
 
-  def run_command(self, cmd: str, set_nemorun_home: bool = True) -> subprocess.CompletedProcess:
+  def run_command(self, cmd: str) -> subprocess.CompletedProcess:
     """Run command on the cluster (locally or via SSH).
 
     Args:
       cmd: Shell command to execute
-      set_nemorun_home: If True, sets NEMORUN_HOME to work_dir before command
 
     Returns:
       CompletedProcess with stdout, stderr, returncode
     """
-    # Prepend NEMORUN_HOME export if work_dir is set
-    if set_nemorun_home and self.executor.work_dir:
-      cmd = f"export NEMORUN_HOME={self.executor.work_dir} && {cmd}"
-
     ssh_prefix = self._build_ssh_prefix()
     if ssh_prefix:
       full_cmd = ssh_prefix + [cmd]
@@ -209,20 +204,15 @@ class Client:
     else:
       return subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-  async def run_command_async(self, cmd: str, set_nemorun_home: bool = True) -> asyncio.subprocess.Process:
+  async def run_command_async(self, cmd: str) -> asyncio.subprocess.Process:
     """Run command asynchronously for streaming output.
 
     Args:
       cmd: Shell command to execute
-      set_nemorun_home: If True, sets NEMORUN_HOME to work_dir before command
 
     Returns:
       Async process with stdout/stderr streams
     """
-    # Prepend NEMORUN_HOME export if work_dir is set
-    if set_nemorun_home and self.executor.work_dir:
-      cmd = f"export NEMORUN_HOME={self.executor.work_dir} && {cmd}"
-
     ssh_prefix = self._build_ssh_prefix()
     if ssh_prefix:
       full_cmd = ssh_prefix + [cmd]
@@ -358,6 +348,78 @@ class Client:
     # Default log path pattern used by Slurm
     return os.path.join(work_dir, f"slurm-{job_id}.out")
 
+  def rsync_files(self, local_paths: List[str], remote_dir: str) -> None:
+    """Rsync local files/directories to the cluster.
+
+    Args:
+      local_paths: List of local file or directory paths to sync
+      remote_dir: Remote directory to sync files into
+
+    Raises:
+      RuntimeError: If rsync/scp fails
+    """
+    if not local_paths:
+      return
+
+    # Ensure remote directory exists
+    mkdir_result = self.run_command(f"mkdir -p {remote_dir}")
+    if mkdir_result.returncode != 0:
+      raise RuntimeError(f"Failed to create remote directory {remote_dir}: {mkdir_result.stderr}")
+
+    for local_path in local_paths:
+      # Expand user home directory
+      local_path = os.path.expanduser(local_path)
+
+      if not os.path.exists(local_path):
+        print(f"Warning: Local path {local_path} does not exist, skipping")
+        continue
+
+      print(f"Syncing {local_path} to {remote_dir}...")
+
+      if self.executor.use_gcloud_ssh and self.executor.login_node:
+        # Use gcloud compute ssh with cat to transfer files
+        # This is needed because gcloud compute scp doesn't support hostname override
+        if self.executor.ssh_hostname:
+          # Build ssh command with hostname override
+          remote_path = os.path.join(remote_dir, os.path.basename(local_path))
+          ssh_cmd = ['gcloud', 'compute', 'ssh', self.executor.login_node,
+                     '--', '-T',
+                     '-o', f'Hostname={self.executor.ssh_hostname}',
+                     '-o', 'StrictHostKeyChecking=no',
+                     '-o', 'UserKnownHostsFile=/dev/null',
+                     f'cat > {remote_path}']
+          with open(local_path, 'rb') as f:
+            result = subprocess.run(ssh_cmd, stdin=f, capture_output=True, text=True)
+        else:
+          # No hostname override needed, use standard gcloud scp
+          cmd = ['gcloud', 'compute', 'scp', '--recurse',
+                 local_path, f'{self.executor.login_node}:{remote_dir}/']
+          result = subprocess.run(cmd, capture_output=True, text=True)
+      elif self.executor.login_node:
+        # Use rsync over SSH for regular SSH connections
+        ssh_cmd = 'ssh ' + ' '.join(SSH_OPTIONS)
+        cmd = ['rsync', '-avz', '--progress', '-e', ssh_cmd,
+               local_path, f'{self.executor.login_node}:{remote_dir}/']
+        result = subprocess.run(cmd, capture_output=True, text=True)
+      else:
+        # Local execution - just copy
+        try:
+          dest = os.path.join(remote_dir, os.path.basename(local_path))
+          if os.path.isdir(local_path):
+            shutil.copytree(local_path, dest, dirs_exist_ok=True)
+          else:
+            shutil.copy2(local_path, dest)
+          continue  # Success, no subprocess result to check
+        except Exception as e:
+          raise RuntimeError(f"Failed to copy {local_path}: {e}")
+
+      if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to sync {local_path} to {remote_dir}: {result.stderr}"
+        )
+
+    print(f"Successfully synced {len(local_paths)} path(s) to {remote_dir}")
+
 
 # =============================================================================
 # Sbatch Script Generation
@@ -406,12 +468,24 @@ def _generate_sbatch_script(
     gpus_per_node = cluster_config.gpus_per_node
 
     # Build command from job executable
-    args = xm.merge_args(job.executable.args, job.args).to_list(utils.ARG_ESCAPER)
+    executable_args = getattr(job.executable, 'args', {})
+    args = xm.merge_args(executable_args, job.args).to_list(utils.ARG_ESCAPER)
     entrypoint = getattr(job.executable, 'entrypoint', None)
     if entrypoint:
       command = f"{entrypoint} {' '.join(args)}".strip()
     else:
       command = ' '.join(args)
+
+    # Build container mounts string (deduplicate to avoid redundant mounts)
+    container_mounts_list = [cluster_config.nccl_dir] + list(getattr(executor, 'container_mounts', []))
+    # Deduplicate while preserving order
+    seen = set()
+    unique_mounts = []
+    for m in container_mounts_list:
+      if m and m not in seen:
+        seen.add(m)
+        unique_mounts.append(m)
+    container_mounts_str = ','.join(unique_mounts)
 
     template_vars = {
         'job_name': job_name,
@@ -420,89 +494,97 @@ def _generate_sbatch_script(
         'partition': getattr(executor, 'partition', None),
         'account': getattr(executor, 'account', None),
         'time_limit': getattr(executor, 'time_limit', None),
+        'exclusive': getattr(executor, 'exclusive', True),
         'command': command,
-        'work_dir': executor.work_dir or os.getcwd(),
-        'log_dir': getattr(executor, 'log_dir', executor.work_dir or os.getcwd()),
+        'working_dir': executor.work_dir,
         'env_vars': getattr(executor, 'env_vars', {}),
-        'cluster_config': cluster_config,
+        'sbatch_flags': getattr(executor, 'sbatch_flags', {}),
+        'prologue_commands': getattr(executor, 'prologue_commands', []),
+        'epilogue_commands': getattr(executor, 'epilogue_commands', []),
+        # NCCL configuration
+        'nccl_setup_script': cluster_config.setup_script,
+        'nccl_lib_path': cluster_config.get_nccl_lib_path(),
+        'nccl_env_vars': cluster_config.nccl_env_vars,
+        # Container configuration
+        'container_image': getattr(executor, 'container_image', None),
+        'container_mounts': container_mounts_str,
+        'use_mpi': getattr(executor, 'use_mpi', False),
+        'container_env_passthrough': getattr(executor, 'container_env_passthrough', []),
+        # Distributed training
+        'master_port': getattr(executor, 'master_port', 29500),
+        'setup_jax_coordinator': getattr(executor, 'setup_jax_coordinator', False),
     }
 
-    renderer = sbatch_templates.SbatchTemplateRenderer()
-    return renderer.render(executor.sbatch_template, template_vars)
-
-  # Mode 3: Auto-generate from launcher
-  if hasattr(executor, 'launcher') and executor.launcher:
-    try:
-      from xmanager.cloud import launchers
-      from xmanager.cloud import sbatch_templates
-    except ImportError as e:
-      raise ImportError(
-          f"launcher mode requires xmanager.cloud.launchers and sbatch_templates modules: {e}"
-      )
-
-    num_nodes = getattr(executor.requirements, 'replicas', 1) or 1
-    gpus_per_node = cluster_config.gpus_per_node
-
-    # Build launcher context
-    ctx = launchers.LauncherContext(
-        num_nodes=num_nodes,
-        gpus_per_node=gpus_per_node,
-        cluster_config=cluster_config,
-        work_dir=executor.work_dir,
-        partition=executor.partition,
-        nccl_env_vars=cluster_config.nccl_env_vars,
-    )
-
-    # Get executable info for launcher
-    executable = job.executable
-    script = getattr(executable, 'path', '')
-
-    # Get args from job.args if available, otherwise empty
-    script_args = []
-    if hasattr(job, 'args') and job.args:
-      job_args = job.args
-      if hasattr(job_args, 'to_list'):
-        # SequentialArgs object
-        script_args = job_args.to_list(lambda x: str(x))
-      elif isinstance(job_args, dict):
-        for k, v in job_args.items():
-          if v is True:
-            script_args.append(str(k))
-          elif v is not None and v is not False:
-            script_args.append(f"{k}={v}")
-      elif hasattr(job_args, '__iter__'):
-        script_args = list(job_args)
-
-    # Use launcher to generate the command
-    launcher_obj = executor.launcher
-    command = launcher_obj.get_launch_command(script, script_args, ctx)
-
-    # Get environment variables from launcher
-    launcher_env_vars = launcher_obj.get_env_vars(ctx)
+    # Add output/error file paths if log_dir is set
+    log_dir = getattr(executor, 'log_dir', None)
+    if log_dir:
+        template_vars['output_file'] = f"{log_dir}/slurm-%j.out"
+        template_vars['error_file'] = f"{log_dir}/slurm-%j.err"
 
     renderer = sbatch_templates.SbatchTemplateRenderer()
-    return renderer.render(
-        job_name=job_name,
-        num_nodes=num_nodes,
-        gpus_per_node=gpus_per_node,
-        partition=getattr(executor, 'partition', None),
-        account=getattr(executor, 'account', None),
-        time_limit=getattr(executor, 'time_limit', '0'),
-        exclusive=getattr(executor, 'exclusive', True),
-        command=command,
-        working_dir=executor.work_dir,
-        env_vars={**launcher_env_vars, **getattr(executor, 'env_vars', {})},
-        sbatch_flags=getattr(executor, 'sbatch_flags', {}),
-        prologue_commands=getattr(executor, 'prologue_commands', []),
-        epilogue_commands=getattr(executor, 'epilogue_commands', []),
-        nccl_setup_script=cluster_config.setup_script,
-        nccl_lib_path=cluster_config.get_nccl_lib_path(),
-        nccl_env_vars=cluster_config.nccl_env_vars,
+    return renderer.render(**template_vars)
+
+  # No valid mode specified - use default template with job executable
+  # This is the common case: user provides container_image and command via job args
+  try:
+    from xmanager.cloud import sbatch_templates
+  except ImportError:
+    raise ImportError(
+        "Default template mode requires xmanager.cloud.sbatch_templates module"
     )
 
-  # No valid mode specified
-  raise ValueError(
-      "Executor must specify one of: sbatch_script, sbatch_template, or launcher"
+  num_nodes = getattr(executor.requirements, 'replicas', 1) or 1
+  gpus_per_node = cluster_config.gpus_per_node
+
+  # Build command from job executable
+  executable_args = getattr(job.executable, 'args', {})
+  args = xm.merge_args(executable_args, job.args).to_list(utils.ARG_ESCAPER)
+  entrypoint = getattr(job.executable, 'entrypoint', None)
+  path = getattr(job.executable, 'path', None)
+  if entrypoint:
+    command = f"{entrypoint} {' '.join(args)}".strip()
+  elif path:
+    command = f"{path} {' '.join(args)}".strip()
+  else:
+    command = ' '.join(args)
+
+  # Build container mounts string (deduplicate to avoid redundant mounts)
+  container_mounts_list = [cluster_config.nccl_dir] + list(getattr(executor, 'container_mounts', []))
+  # Deduplicate while preserving order
+  seen = set()
+  unique_mounts = []
+  for m in container_mounts_list:
+    if m and m not in seen:
+      seen.add(m)
+      unique_mounts.append(m)
+  container_mounts_str = ','.join(unique_mounts)
+
+  renderer = sbatch_templates.SbatchTemplateRenderer()
+  return renderer.render(
+      job_name=job_name,
+      num_nodes=num_nodes,
+      gpus_per_node=gpus_per_node,
+      partition=getattr(executor, 'partition', None),
+      account=getattr(executor, 'account', None),
+      time_limit=getattr(executor, 'time_limit', None),
+      exclusive=getattr(executor, 'exclusive', True),
+      command=command,
+      working_dir=executor.work_dir,
+      env_vars=getattr(executor, 'env_vars', {}),
+      sbatch_flags=getattr(executor, 'sbatch_flags', {}),
+      prologue_commands=getattr(executor, 'prologue_commands', []),
+      epilogue_commands=getattr(executor, 'epilogue_commands', []),
+      nccl_setup_script=cluster_config.setup_script,
+      nccl_lib_path=cluster_config.get_nccl_lib_path(),
+      nccl_env_vars=cluster_config.nccl_env_vars,
+      # Container configuration
+      container_image=getattr(executor, 'container_image', None),
+      container_mounts=container_mounts_str,
+      use_mpi=getattr(executor, 'use_mpi', False),
+      container_env_passthrough=getattr(executor, 'container_env_passthrough', []),
+      # Distributed training
+      master_port=getattr(executor, 'master_port', 29500),
+      setup_jax_coordinator=getattr(executor, 'setup_jax_coordinator', False),
   )
 
 
@@ -694,6 +776,16 @@ async def launch(
     # Ensure work directory exists
     work_dir = executor.work_dir or os.getcwd()
 
+    # Rsync local files to cluster if specified
+    local_files = getattr(executor, 'local_files', [])
+    if local_files:
+      try:
+        client.rsync_files(local_files, work_dir)
+      except Exception as e:
+        raise RuntimeError(
+            f"Failed to sync local files for job {job_name}: {e}"
+        )
+
     # Generate sbatch script
     try:
       script_content = _generate_sbatch_script(
@@ -720,6 +812,8 @@ async def launch(
         client=client,
         executor=executor,
     )
+
+    # Note: save_to_storage is called by experiment.py's _save_handles_to_storage
 
     # Start monitoring if enabled
     if executor.stream_output:

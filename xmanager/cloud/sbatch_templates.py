@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 from jinja2 import Environment, StrictUndefined, Template
 
 
-DEFAULT_SBATCH_TEMPLATE = """#!/bin/bash
+DEFAULT_SBATCH_TEMPLATE = r"""#!/bin/bash
 #SBATCH --job-name={{ job_name }}
 {% if partition is defined and partition %}
 #SBATCH --partition={{ partition }}
@@ -33,9 +33,7 @@ DEFAULT_SBATCH_TEMPLATE = """#!/bin/bash
 {% if gpus_per_node is defined and gpus_per_node %}
 #SBATCH --gpus-per-node={{ gpus_per_node }}
 {% endif %}
-{% if ntasks_per_node is defined and ntasks_per_node %}
-#SBATCH --ntasks-per-node={{ ntasks_per_node }}
-{% endif %}
+#SBATCH --ntasks-per-node=1
 {% if cpus_per_task is defined and cpus_per_task %}
 #SBATCH --cpus-per-task={{ cpus_per_task }}
 {% endif %}
@@ -45,6 +43,7 @@ DEFAULT_SBATCH_TEMPLATE = """#!/bin/bash
 {% if exclusive is defined and exclusive %}
 #SBATCH --exclusive
 {% endif %}
+#SBATCH --mem=0
 {% if output_file is defined and output_file %}
 #SBATCH --output={{ output_file }}
 {% endif %}
@@ -61,16 +60,45 @@ DEFAULT_SBATCH_TEMPLATE = """#!/bin/bash
 {% endfor %}
 {% endif %}
 
-# Extract MASTER_ADDR from SLURM_NODELIST
-export MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
-export MASTER_PORT={{ master_port | default(29500) }}
+set -x
+set -e
 
-# NCCL setup
+echo "========================================================"
+echo "XManager Vertex Training Cluster Job"
+echo "========================================================"
+echo "Job ID: $SLURM_JOB_ID"
+echo "Nodes: $SLURM_NNODES"
+echo "Started: $(date)"
+echo "========================================================"
+
+# =============================================================================
+# HEAD NODE DISCOVERY (Required for distributed training)
+# =============================================================================
+echo "Discovering head node..."
+nodes_array=( $(scontrol show hostnames "$SLURM_JOB_NODELIST") )
+head_node=${nodes_array[0]}
+head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
+echo "Head node: $head_node ($head_node_ip)"
+
+export MASTER_ADDR="$head_node_ip"
+export MASTER_PORT={{ master_port | default(29500) }}
+export GPUS_PER_NODE={{ gpus_per_node | default(8) }}
+
+{% if setup_jax_coordinator is defined and setup_jax_coordinator %}
+# JAX Distributed Setup
+export JAX_COORDINATOR_ADDRESS="${MASTER_ADDR}:${MASTER_PORT}"
+echo "JAX_COORDINATOR_ADDRESS: $JAX_COORDINATOR_ADDRESS"
+{% endif %}
+
+# =============================================================================
+# NCCL CONFIGURATION
+# =============================================================================
 {% if nccl_setup_script is defined and nccl_setup_script %}
+echo "Setting up NCCL..."
 source {{ nccl_setup_script | shell_quote }}
 {% endif %}
 {% if nccl_lib_path is defined and nccl_lib_path %}
-export LD_LIBRARY_PATH={{ nccl_lib_path | shell_quote }}:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH={{ nccl_lib_path | shell_quote }}:${LD_LIBRARY_PATH:-}
 {% endif %}
 {% if nccl_env_vars is defined and nccl_env_vars %}
 {% for key, value in nccl_env_vars.items() %}
@@ -78,34 +106,82 @@ export {{ key }}={{ value | shell_quote }}
 {% endfor %}
 {% endif %}
 
-# User environment variables
+# =============================================================================
+# USER ENVIRONMENT VARIABLES
+# =============================================================================
 {% if env_vars is defined and env_vars %}
 {% for key, value in env_vars.items() %}
 export {{ key }}={{ value | shell_quote }}
 {% endfor %}
 {% endif %}
 
-# Prologue commands
+# =============================================================================
+# PROLOGUE COMMANDS
+# =============================================================================
 {% if prologue_commands is defined and prologue_commands %}
 {% for cmd in prologue_commands %}
 {{ cmd }}
 {% endfor %}
 {% endif %}
 
-# Change to working directory
+# =============================================================================
+# JOB IDENTIFIER
+# =============================================================================
+TIME=$(TZ="America/Los_Angeles" date +"%Y%m%d_%H%M%S")
+export JOB_IDENTIFIER="{{ job_name }}-${SLURM_NNODES}n-${TIME}"
+echo "JOB_IDENTIFIER: $JOB_IDENTIFIER"
+
 {% if working_dir is defined and working_dir %}
 cd {{ working_dir | shell_quote }}
 {% endif %}
 
-# Execute main command
-{{ command }}
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+{% if container_image is defined and container_image %}
+echo "Launching container..."
+CONTAINER_MOUNTS="{{ container_mounts | default('') }}"
 
-# Epilogue commands
+srun \
+  --job-name=${JOB_IDENTIFIER} \
+  --nodes=${SLURM_NNODES} \
+  --container-image={{ container_image | shell_quote }} \
+  --container-mounts=${CONTAINER_MOUNTS} \
+  --no-container-mount-home \
+  --container-writable \
+{% if use_mpi is defined and use_mpi %}
+  --mpi=pmix \
+{% endif %}
+{% if container_env_passthrough is defined and container_env_passthrough %}
+  --container-env={{ container_env_passthrough | join(',') }} \
+{% endif %}
+  bash -c "
+set -x
+set -e
+{% if nccl_lib_path is defined and nccl_lib_path %}
+export LD_LIBRARY_PATH={{ nccl_lib_path | shell_quote }}:\${LD_LIBRARY_PATH:-}
+{% endif %}
+echo 'Container started on node rank '\${SLURM_PROCID}' of '\${SLURM_NNODES}
+{{ command }}
+echo 'Container finished on '\$(hostname)
+"
+{% else %}
+# Direct execution (no container)
+{{ command }}
+{% endif %}
+
+# =============================================================================
+# EPILOGUE
+# =============================================================================
 {% if epilogue_commands is defined and epilogue_commands %}
 {% for cmd in epilogue_commands %}
 {{ cmd }}
 {% endfor %}
 {% endif %}
+
+echo "========================================================"
+echo "Job completed at $(date)"
+echo "========================================================"
 """
 
 
@@ -183,6 +259,11 @@ def render_sbatch_for_cluster(
     output_file: Optional[str] = None,
     error_file: Optional[str] = None,
     master_port: Optional[int] = None,
+    container_image: Optional[str] = None,
+    container_mounts: Optional[str] = None,
+    use_mpi: bool = False,
+    container_env_passthrough: Optional[List[str]] = None,
+    setup_jax_coordinator: bool = False,
 ) -> str:
     """Convenience function to render an SBATCH script for a cluster.
 
@@ -202,6 +283,11 @@ def render_sbatch_for_cluster(
         output_file: Path for stdout output file.
         error_file: Path for stderr output file.
         master_port: Port for distributed training master.
+        container_image: Path to container image (.sqsh or docker path).
+        container_mounts: Comma-separated mount string for srun.
+        use_mpi: Whether to add --mpi=pmix to srun.
+        container_env_passthrough: List of env vars to pass via --container-env.
+        setup_jax_coordinator: Whether to export JAX_COORDINATOR_ADDRESS.
 
     Returns:
         Rendered SBATCH script as a string.
@@ -254,5 +340,17 @@ def render_sbatch_for_cluster(
         variables["error_file"] = error_file
     if master_port:
         variables["master_port"] = master_port
+
+    # Container and distributed training options
+    if container_image:
+        variables["container_image"] = container_image
+    if container_mounts:
+        variables["container_mounts"] = container_mounts
+    if use_mpi:
+        variables["use_mpi"] = use_mpi
+    if container_env_passthrough:
+        variables["container_env_passthrough"] = container_env_passthrough
+    if setup_jax_coordinator:
+        variables["setup_jax_coordinator"] = setup_jax_coordinator
 
     return renderer.render(**variables)
