@@ -304,6 +304,14 @@ class VertexTrainingCluster(xm.Executor):
   # Log streaming
   stream_output: bool = True
 
+  # TensorBoard integration (logs to GCS, view in Vertex AI TensorBoard)
+  # If set, creates/gets a Vertex AI TensorBoard instance during launch
+  tensorboard: Optional[TensorboardCapability] = None
+  # Vertex AI region for TensorBoard (e.g., 'us-central1', 'europe-west4')
+  tensorboard_region: str = 'us-central1'
+  # GCP project for TensorBoard (if different from default ADC project)
+  tensorboard_project: Optional[str] = None
+
   Spec = VertexTrainingClusterSpec  # pylint: disable=invalid-name
 
   def __attrs_post_init__(self):

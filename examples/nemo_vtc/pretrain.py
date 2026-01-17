@@ -35,6 +35,7 @@ def configure_recipe(
     val_check_interval: int = 10,
     val_batches: int = 5,
     explicit_log_dir: str = "/mnt/logs",
+    tensorboard_log_dir: Optional[str] = None,
     resume_if_exists: bool = True,
     resume_ignore_no_checkpoint: bool = True,
     tensor_model_parallel_size: int = 4,
@@ -42,15 +43,33 @@ def configure_recipe(
     virtual_pipeline_model_parallel_size: int = 5,
     context_parallel_size: int = 2,
 ) -> run.Partial[llm.pretrain]:
-    """Factory function to configure Llama31-70b pretraining recipe."""
+    """Factory function to configure Llama31-70b pretraining recipe.
+
+    Args:
+        explicit_log_dir: Directory for checkpoints (on Lustre).
+        tensorboard_log_dir: Directory for TensorBoard logs only (on GCS).
+            Set to $AIP_TENSORBOARD_LOG_DIR for VMDS TensorBoard integration.
+    """
     pretrain = llama31.pretrain_recipe(
         performance_mode=False)
+
+    # Configure TensorBoard logger separately if tensorboard_log_dir is specified
+    # This allows checkpoints on Lustre while TensorBoard logs go to GCS
+    tb_logger = None
+    if tensorboard_log_dir:
+        tb_logger = run.Config(
+            TensorBoardLogger,
+            save_dir=tensorboard_log_dir,
+            name="",
+            version="",
+        )
 
     pretrain.log = run.Config(
         nl.NeMoLogger,
         explicit_log_dir=explicit_log_dir,
         log_global_rank_0_only=True,
-        update_logger_directory=True,
+        update_logger_directory=False if tensorboard_log_dir else True,
+        tensorboard=tb_logger,
         ckpt=run.Config(
             nl.ModelCheckpoint,
             save_top_k=3,

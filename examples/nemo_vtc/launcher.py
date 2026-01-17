@@ -22,6 +22,7 @@ Features:
   - Container-based execution (work_dir mounted at same path in container)
   - torchrun with rendezvous endpoint for multi-node training
   - NCCL configuration per cluster type
+  - Native Vertex AI TensorBoard integration via sbatch --extra flag
 
 Directory structure on cluster:
   work_dir/
@@ -33,6 +34,10 @@ To rsync local files to the cluster, use --local_files:
   --local_files=./pretrain.py --local_files=./my_config.yaml
 
 Usage:
+   # Set environment variables for your cluster
+   export LUSTRE_INSTANCE_NAME=ls1-europe-west4-a
+   export LOGS_PATH=/mnt/lustre/${LUSTRE_INSTANCE_NAME}/jobs
+
    xmanager launch examples/nemo_vtc/launcher.py -- \
     --cluster_type=hcc-a3u \
     --partition=a3u \
@@ -40,12 +45,34 @@ Usage:
     --use_gcloud_ssh \
     --ssh_hostname=nic0.vmdsa3u04-login-001.europe-west4-a.c.ai-infra-recipe-validation.internal.gcpnode.com \
     --work_dir=/home/abhishekbhgwt_google_com/vertexai-mds/nemo \
-    --container_image=/mnt/lustre/ls1-europe-west4-a/images/nemo.25.07.sqsh \
+    --logs_path=${LOGS_PATH} \
+    --container_image=/home/common/images/nemo.25.07.sqsh \
     --training_script=pretrain.py \
-    --extra_args="--factory='configure_recipe(explicit_log_dir=/home/abhishekbhgwt_google_com/vertexai-mds/nemo/logs/xmanager/)'" \
+    --extra_args="--factory='configure_recipe(explicit_log_dir=${LOGS_PATH}/\${JOB_IDENTIFIER}/)'" \
     --extra_args="trainer.num_nodes=\${SLURM_NNODES}" \
     --extra_args="trainer.max_steps=15" \
     --account=aaie \
+    --nodes=8
+
+   # With TensorBoard integration (logs to GCS, checkpoints stay on Lustre):
+   # VMDS sets AIP_TENSORBOARD_LOG_DIR - pass it to tensorboard_log_dir
+   xmanager launch examples/nemo_vtc/launcher.py -- \
+    --cluster_type=hcc-a3u \
+    --partition=a3u \
+    --login_node=vmdsa3u04-login-001 \
+    --use_gcloud_ssh \
+    --ssh_hostname=nic0.vmdsa3u04-login-001.europe-west4-a.c.ai-infra-recipe-validation.internal.gcpnode.com \
+    --work_dir=/home/abhishekbhgwt_google_com/vertexai-mds/nemo \
+    --logs_path=${LOGS_PATH} \
+    --container_image=/home/common/images/nemo.25.07.sqsh \
+    --tensorboard=ai-infra-europe-west4-tb \
+    --tensorboard_region=europe-west4 \
+    --tensorboard_project=ai-infra-recipe-validation \
+    --tensorboard_gcs_path=ai-infra-gcs-europe-west4 \
+    --local_files=/usr/local/google/home/abhishekbhgwt/xmanager/examples/nemo_vtc/pretrain.py \
+    --extra_args="--factory='configure_recipe(explicit_log_dir=${LOGS_PATH}/\${JOB_IDENTIFIER}/, tensorboard_log_dir=\${AIP_TENSORBOARD_LOG_DIR})'" \
+    --extra_args="trainer.num_nodes=\${SLURM_NNODES}" \
+    --extra_args="trainer.max_steps=5" \
     --nodes=4
 """
 
@@ -66,8 +93,12 @@ _TIME_LIMIT = flags.DEFINE_string('time_limit', None, 'Time limit (e.g., "1:00:0
 # Paths on cluster
 _WORK_DIR = flags.DEFINE_string(
     'work_dir', None,
-    'Working directory on cluster (required). Contains scripts, logs, etc. '
+    'Working directory on cluster (required). Contains scripts, etc. '
     'Mounted at same path inside container.')
+_LOGS_PATH = flags.DEFINE_string(
+    'logs_path', None,
+    'Path for job logs and checkpoints on Managed Lustre (optional). '
+    'If not set, logs are written to work_dir. Example: /mnt/lustre/<instance>/jobs')
 _CONTAINER_IMAGE = flags.DEFINE_string(
     'container_image', None, 'Container image path (.sqsh) on cluster (required)')
 
@@ -101,6 +132,22 @@ _DRY_RUN = flags.DEFINE_bool(
 _STREAM_OUTPUT = flags.DEFINE_bool(
     'stream_output', True, 'Stream job output via SSH tail -f')
 
+# TensorBoard integration (native VTC support via sbatch --extra)
+_TENSORBOARD = flags.DEFINE_string(
+    'tensorboard', None,
+    'Vertex AI TensorBoard display name (e.g., "ai-infra-europe-west4-tb"). '
+    'If set, enables native VTC TensorBoard integration. '
+    'Instance will be looked up or created automatically.')
+_TENSORBOARD_REGION = flags.DEFINE_string(
+    'tensorboard_region', 'us-central1',
+    'Vertex AI region for TensorBoard instance (e.g., "europe-west4").')
+_TENSORBOARD_PROJECT = flags.DEFINE_string(
+    'tensorboard_project', None,
+    'GCP project ID for TensorBoard. If not set, uses default ADC project.')
+_TENSORBOARD_GCS_PATH = flags.DEFINE_string(
+    'tensorboard_gcs_path', None,
+    'GCS bucket path for TensorBoard logs (e.g., "my-bucket").')
+
 
 def main(_):
   if not _WORK_DIR.value:
@@ -113,16 +160,19 @@ def main(_):
   print("=" * 60)
 
   work_dir = _WORK_DIR.value
+  logs_path = _LOGS_PATH.value if _LOGS_PATH.value else work_dir
   training_script = _TRAINING_SCRIPT.value
 
   with xm_local.create_experiment(
       experiment_title=f'vtc_nemo_{_EXP_NAME.value}'
   ) as experiment:
 
-    # Build container mounts - mount work_dir at same path inside container
+    # Build container mounts - mount work_dir and logs_path at same path inside container
     # Note: gIB mount (/usr/local/gib) is automatically added by vertex_training_cluster.py
     # based on cluster_config.nccl_dir, so we don't add it here
     container_mounts = [f"{work_dir}:{work_dir}"]
+    if _LOGS_PATH.value and _LOGS_PATH.value != work_dir:
+      container_mounts.append(f"{logs_path}:{logs_path}")
 
     # Environment variables
     env_vars = {
@@ -136,6 +186,14 @@ def main(_):
 
     # Container env passthrough for srun --container-env
     container_env_passthrough = ['NCCL_SOCKET_IFNAME', 'NCCL_DEBUG', 'OMP_NUM_THREADS']
+
+    # TensorBoard integration (optional)
+    tensorboard = None
+    if _TENSORBOARD.value or _TENSORBOARD_GCS_PATH.value:
+      tensorboard = xm_local.TensorboardCapability(
+          name=_TENSORBOARD.value or '',
+          base_output_directory=_TENSORBOARD_GCS_PATH.value,
+      )
 
     # Create executor
     executor = xm_local.VertexTrainingCluster(
@@ -172,6 +230,11 @@ def main(_):
 
         # Log streaming
         stream_output=_STREAM_OUTPUT.value,
+
+        # TensorBoard integration
+        tensorboard=tensorboard,
+        tensorboard_region=_TENSORBOARD_REGION.value,
+        tensorboard_project=_TENSORBOARD_PROJECT.value,
     )
 
     # Get cluster configuration for display
@@ -184,10 +247,16 @@ def main(_):
     print(f"  Nodes: {_NODES.value}")
     print(f"  Total GPUs: {_NODES.value * cluster_config.gpus_per_node}")
     print(f"  Work dir: {work_dir}")
+    print(f"  Logs path: {logs_path}")
     print(f"  Container: {_CONTAINER_IMAGE.value}")
     print(f"  Training script: {work_dir}/{training_script}")
     print(f"  Partition: {_PARTITION.value}")
     print(f"  Use host gIB: {_USE_HOST_PLUGIN.value}")
+    if tensorboard:
+      print(f"  TensorBoard: {_TENSORBOARD.value}")
+      print(f"  TensorBoard Region: {_TENSORBOARD_REGION.value}")
+      print(f"  TensorBoard Project: {_TENSORBOARD_PROJECT.value or '(default ADC project)'}")
+      print(f"  TensorBoard GCS Path: {_TENSORBOARD_GCS_PATH.value}")
 
     if _DRY_RUN.value:
       print("\n[DRY RUN] Configuration validated, not submitting job")
@@ -247,7 +316,8 @@ def main(_):
     print("\nJob submitted! Use the following to monitor:")
     print(f"  squeue --me")
     print(f"  xmanager list")
-    print(f"\nLogs will be in: {work_dir}")
+    print(f"\nSlurm logs: {work_dir}/slurm-<job_id>.out")
+    print(f"NeMo logs/checkpoints: {logs_path}/<job_id>/")
 
 
 if __name__ == '__main__':

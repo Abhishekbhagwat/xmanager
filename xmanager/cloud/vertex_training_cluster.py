@@ -37,6 +37,8 @@ from typing import Any, Dict, List, Optional
 
 import attr
 from xmanager import xm
+from xmanager.cloud import auth
+from xmanager.cloud import vertex
 from xmanager.xm import utils
 from xmanager.xm_local import executors as local_executors
 from xmanager.xm_local import handles
@@ -487,6 +489,27 @@ def _generate_sbatch_script(
         unique_mounts.append(m)
     container_mounts_str = ','.join(unique_mounts)
 
+    # Build sbatch_flags with TensorBoard integration if configured
+    sbatch_flags = dict(getattr(executor, 'sbatch_flags', {}))
+    if hasattr(executor, 'tensorboard') and executor.tensorboard:
+      extra_parts = []
+      # Add tensorboard_base_output_dir (GCS bucket path, e.g., bucket-name/path)
+      # VMDS expects bucket/path format, not /gcs/... or gs://...
+      if executor.tensorboard.base_output_directory:
+        gcs_path = executor.tensorboard.base_output_directory
+        # Strip /gcs/ prefix if present (mounted GCS path)
+        if gcs_path.startswith('/gcs/'):
+          gcs_path = gcs_path[5:]
+        # Strip gs:// prefix if present
+        elif gcs_path.startswith('gs://'):
+          gcs_path = gcs_path[5:]
+        extra_parts.append(f'tensorboard_base_output_dir={gcs_path}')
+      # Add tensorboard_url (the Vertex AI TensorBoard instance URL)
+      if executor.tensorboard.name:
+        extra_parts.append(f'tensorboard_url={executor.tensorboard.name}')
+      if extra_parts:
+        sbatch_flags['extra'] = ','.join(extra_parts)
+
     template_vars = {
         'job_name': job_name,
         'num_nodes': num_nodes,
@@ -498,7 +521,7 @@ def _generate_sbatch_script(
         'command': command,
         'working_dir': executor.work_dir,
         'env_vars': getattr(executor, 'env_vars', {}),
-        'sbatch_flags': getattr(executor, 'sbatch_flags', {}),
+        'sbatch_flags': sbatch_flags,
         'prologue_commands': getattr(executor, 'prologue_commands', []),
         'epilogue_commands': getattr(executor, 'epilogue_commands', []),
         # NCCL configuration
@@ -559,6 +582,27 @@ def _generate_sbatch_script(
       unique_mounts.append(m)
   container_mounts_str = ','.join(unique_mounts)
 
+  # Build sbatch_flags with TensorBoard integration if configured
+  sbatch_flags = dict(getattr(executor, 'sbatch_flags', {}))
+  if hasattr(executor, 'tensorboard') and executor.tensorboard:
+    extra_parts = []
+    # Add tensorboard_base_output_dir (GCS bucket path, e.g., bucket-name/path)
+    # VMDS expects bucket/path format, not /gcs/... or gs://...
+    if executor.tensorboard.base_output_directory:
+      gcs_path = executor.tensorboard.base_output_directory
+      # Strip /gcs/ prefix if present (mounted GCS path)
+      if gcs_path.startswith('/gcs/'):
+        gcs_path = gcs_path[5:]
+      # Strip gs:// prefix if present
+      elif gcs_path.startswith('gs://'):
+        gcs_path = gcs_path[5:]
+      extra_parts.append(f'tensorboard_base_output_dir={gcs_path}')
+    # Add tensorboard_url (the Vertex AI TensorBoard instance URL)
+    if executor.tensorboard.name:
+      extra_parts.append(f'tensorboard_url={executor.tensorboard.name}')
+    if extra_parts:
+      sbatch_flags['extra'] = ','.join(extra_parts)
+
   renderer = sbatch_templates.SbatchTemplateRenderer()
   return renderer.render(
       job_name=job_name,
@@ -571,7 +615,7 @@ def _generate_sbatch_script(
       command=command,
       working_dir=executor.work_dir,
       env_vars=getattr(executor, 'env_vars', {}),
-      sbatch_flags=getattr(executor, 'sbatch_flags', {}),
+      sbatch_flags=sbatch_flags,
       prologue_commands=getattr(executor, 'prologue_commands', []),
       epilogue_commands=getattr(executor, 'epilogue_commands', []),
       nccl_setup_script=cluster_config.setup_script,
@@ -785,6 +829,25 @@ async def launch(
         raise RuntimeError(
             f"Failed to sync local files for job {job_name}: {e}"
         )
+
+    # Resolve TensorBoard instance if configured with display name
+    if hasattr(executor, 'tensorboard') and executor.tensorboard:
+      tb_name = executor.tensorboard.name
+      # If name doesn't look like a full resource URL, resolve it
+      if tb_name and not tb_name.startswith('projects/'):
+        try:
+          region = getattr(executor, 'tensorboard_region', 'us-central1')
+          project = getattr(executor, 'tensorboard_project', None)
+          vertex_client = vertex.Client(project=project, location=region)
+          full_tb_name = await vertex_client.get_or_create_tensorboard(tb_name)
+          # Update the tensorboard name to full resource URL
+          executor.tensorboard = local_executors.TensorboardCapability(
+              name=full_tb_name,
+              base_output_directory=executor.tensorboard.base_output_directory,
+          )
+          print(f"Using TensorBoard: {full_tb_name}")
+        except Exception as e:
+          print(f"Warning: Failed to resolve TensorBoard '{tb_name}': {e}")
 
     # Generate sbatch script
     try:
