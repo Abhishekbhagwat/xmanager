@@ -13,5 +13,6 @@
 # limitations under the License.
 """Vizier API for launching Vertex-Vizier explored Experiment for OSS."""
 
+from xmanager.vizier.vizier_cloud.gcs_metric_reader import GCSMetricReader
 from xmanager.vizier.vizier_cloud.study_factory import NewStudy
 from xmanager.vizier.vizier_cloud.vizier_exploration import VizierExploration

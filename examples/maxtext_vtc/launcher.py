@@ -12,276 +12,323 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""XManager launcher for MaxText on Vertex Training Cluster.
+r"""XManager launcher for MaxText Vizier hyperparameter optimization on VTC.
 
-This example demonstrates how to run MaxText training on Slurm-based
-Vertex Training Clusters using the XManager integration with JAX distributed
-training support.
+This launcher runs Vertex AI Vizier hyperparameter optimization for MaxText
+training jobs on Slurm-based Vertex Training Clusters.
 
 Features:
   - JAX distributed training with automatic coordinator setup
-  - Rsync of local config files to the cluster
-  - Container-based execution with proper GCS and data mounting
-  - Automatic NCCL configuration per cluster type
-  - Job status monitoring and log streaming
-
-The executor provides optimized NCCL configurations per cluster type:
-  - hcc-a3m: H100 with TCPXO
-  - hcc-a3u: H200 with gIB
-  - hcc-a4: B200 with gIB
-  - hcc-a3h: H100 with gIB
+  - Vertex AI Vizier for Bayesian hyperparameter optimization
+  - GCS-based metric reading from TensorBoard logs
+  - Uses ADC (Application Default Credentials) for project/region
+  - Local file sync via --local_files (rsync to work_dir before job submission)
 
 Usage:
-   xmanager launch examples/maxtext_vtc/launcher.py -- \
-    --cluster_type=hcc-a4 \
-    --partition=a4 \
-    --login_node=vmdsa405-login-001 \
+  xmanager launch examples/maxtext_vtc/launcher.py -- \
+    --cluster_type=hcc-a3u \
+    --partition=a3u \
+    --login_node=vmdsa3u04-login-001 \
     --use_gcloud_ssh \
-    --ssh_hostname=nic0.vmdsa405-login-001.asia-southeast1-b.c.ai-infra-recipe-validation.internal.gcpnode.com \
-    --work_dir=/home/abhishekbhgwt_google_com/vertexai-mds/maxtext \
-    --maxtext_dir=/workspace/MaxText \
-    --config_file=./config.yaml \
-    --account=aaie \
-    --nodes=2
+    --ssh_hostname=nic0.vmdsa3u04-login-001.europe-west4-a.c.ai-infra-recipe-validation.internal.gcpnode.com \
+    --work_dir=/home/abhishekbhgwt_google_com/vertexai-mds/nemo \
+    --container_image=/mnt/lustre/ls1-europe-west4-a/images/jax-maxtext-2025-10-01.sqsh \
+    --config_file=/mnt/jobs/config.yaml \
+    --gcs_bucket=ai-infra-gcs-europe-west4 \
+    --cluster_id=vmdsa3u04-7070932889948389376 \
+    --nodes=2 \
+    --num_trials=5
 
-Prerequisites:
-  1. A squashfs container image with JAX/MaxText installed
-  2. A config.yaml file with MaxText hyperparameters
-  3. Access to a Vertex Training Cluster
-  4. SSH access to the cluster login node
+To copy local config files to the cluster:
+  --local_files=./gemma3-27b.yaml --local_files=./another-config.yaml
 
-Container Setup:
-  Your container should include:
-  - JAX with GPU support
-  - MaxText and dependencies
-  - Any custom model code or datasets
+To find your cluster_id:
+  gsutil ls gs://<your-bucket>/
 """
+
+from google.cloud import aiplatform_v1beta1 as aip
 
 from absl import app
 from absl import flags
 from xmanager import xm
 from xmanager import xm_local
+from xmanager.vizier import vizier_cloud
 
-# Cluster configuration
+# =============================================================================
+# Cluster Configuration
+# =============================================================================
 _CLUSTER_TYPE = flags.DEFINE_string(
-    'cluster_type', 'hcc-a4',
-    'Cluster type: hcc-a3m (H100), hcc-a3u (H200), hcc-a4 (B200), hcc-a3h (H100)')
-_PARTITION = flags.DEFINE_string('partition', 'a4', 'Slurm partition')
+    'cluster_type', 'hcc-a3u',
+    'Cluster type: hcc-a3m, hcc-a3u, hcc-a4, hcc-a3h')
+_PARTITION = flags.DEFINE_string('partition', 'a3u', 'Slurm partition')
 _ACCOUNT = flags.DEFINE_string('account', None, 'Slurm account (optional)')
-_NODES = flags.DEFINE_integer('nodes', 4, 'Number of nodes for training')
-_TIME_LIMIT = flags.DEFINE_string('time_limit', '0', 'Time limit (0=unlimited)')
+_NODES = flags.DEFINE_integer('nodes', 2, 'Number of nodes')
+_TIME_LIMIT = flags.DEFINE_string('time_limit', None, 'Time limit (e.g., "1:00:00")')
 
-# Paths on cluster
+# =============================================================================
+# Paths and Container
+# =============================================================================
 _WORK_DIR = flags.DEFINE_string(
-    'work_dir', None, 'Working directory on cluster (required)')
+    'work_dir', '/home/abhishekbhgwt_google_com/vertexai-mds/maxtext',
+    'Working directory on cluster (required)')
 _MAXTEXT_DIR = flags.DEFINE_string(
     'maxtext_dir', '/workspace/MaxText',
-    'MaxText installation directory (in container or on cluster)')
-_IMAGE = flags.DEFINE_string(
-    'image', 'maxtext-jax.sqsh',
-    'Container image (squashfs) relative to work_dir or absolute path')
-
-# Local paths to rsync
+    'MaxText installation directory in container')
+_CONTAINER_IMAGE = flags.DEFINE_string(
+    'container_image', '/mnt/lustre/ls1-europe-west4-a/images/jax-maxtext-2025-10-01.sqsh',
+    'Container image path (.sqsh) on cluster')
 _CONFIG_FILE = flags.DEFINE_string(
-    'config_file', './config.yaml',
-    'Local path to MaxText config.yaml to rsync to cluster')
-_EXTRA_FILES = flags.DEFINE_multi_string(
-    'extra_files', [],
-    'Additional local files/directories to rsync (e.g., custom datasets, scripts)')
+    'config_file', '/mnt/jobs/gemma3-27b.yaml',
+    'Path to MaxText config file on cluster')
 
-# MaxText training configuration
-_TRAIN_SCRIPT = flags.DEFINE_string(
-    'train_script', 'train.py',
-    'Training script name (relative to maxtext_dir)')
-_RUN_NAME = flags.DEFINE_string(
-    'run_name', 'maxtext-run', 'Run name for experiment tracking')
-
-# GCS and data paths
+# =============================================================================
+# GCS Configuration
+# =============================================================================
 _GCS_BUCKET = flags.DEFINE_string(
-    'gcs_bucket', None,
-    'GCS bucket for checkpoints and logs (e.g., gs://my-bucket)')
-_DATA_DIR = flags.DEFINE_string(
-    'data_dir', '/mnt/data',
-    'Data directory path (on cluster or mounted storage)')
+    'gcs_bucket', None, 'GCS bucket name (required, e.g., my-bucket)')
+_CLUSTER_ID = flags.DEFINE_string(
+    'cluster_id', None,
+    'Cluster ID for GCS paths (required). Find with: gsutil ls gs://<bucket>/')
 
+# =============================================================================
+# Training Configuration
+# =============================================================================
+_STEPS = flags.DEFINE_integer('steps', 10, 'Training steps per trial')
+
+# =============================================================================
 # Connection
-_LOGIN_NODE = flags.DEFINE_string('login_node', None, 'SSH login node')
-_USE_GCLOUD_SSH = flags.DEFINE_bool('use_gcloud_ssh', False, 'Use gcloud SSH')
-_SSH_HOSTNAME = flags.DEFINE_string(
-    'ssh_hostname', None,
-    'SSH hostname override (for gcloud ssh -o Hostname=...)')
+# =============================================================================
+_LOGIN_NODE = flags.DEFINE_string('login_node', None, 'SSH login node (required)')
+_USE_GCLOUD_SSH = flags.DEFINE_bool('use_gcloud_ssh', False, 'Use gcloud compute ssh')
+_SSH_HOSTNAME = flags.DEFINE_string('ssh_hostname', None, 'SSH hostname override')
 
-# Flags
-_DRY_RUN = flags.DEFINE_bool(
-    'dry_run', False, 'Print configuration but do not submit job')
-_STREAM_OUTPUT = flags.DEFINE_bool(
-    'stream_output', True, 'Stream job output via SSH tail -f')
+# =============================================================================
+# Vizier Configuration
+# =============================================================================
+_NUM_TRIALS = flags.DEFINE_integer('num_trials', 5, 'Number of Vizier trials')
+_NUM_PARALLEL = flags.DEFINE_integer('num_parallel', 1, 'Parallel trials')
+_VIZIER_METRIC = flags.DEFINE_string(
+    'metric', 'learning/loss', 'Metric to optimize from TensorBoard')
+_VIZIER_PROJECT = flags.DEFINE_string(
+    'vizier_project', 'ai-infra-recipe-validation',
+    'GCP project for Vizier study (overrides ADC)')
+_VIZIER_REGION = flags.DEFINE_string(
+    'vizier_region', 'europe-west4',
+    'GCP region for Vizier study (overrides ADC)')
 
+# =============================================================================
+# Local Files (rsync to work_dir before submission)
+# =============================================================================
+_LOCAL_FILES = flags.DEFINE_multi_string(
+    'local_files', [],
+    'Local files/directories to rsync to work_dir before submission '
+    '(e.g., config files)')
+
+# =============================================================================
+# Other
+# =============================================================================
+_DRY_RUN = flags.DEFINE_bool('dry_run', False, 'Validate config without submitting')
+
+
+def get_study_spec() -> aip.StudySpec:
+  """Define the Vizier study specification.
+
+  Modify this function to change the hyperparameters being optimized.
+  """
+  return aip.StudySpec(
+      # Let Vizier choose the algorithm (typically Bayesian optimization)
+      algorithm=aip.StudySpec.Algorithm.ALGORITHM_UNSPECIFIED,
+
+      parameters=[
+          # Learning rate: log-scale search from 1e-5 to 1e-3
+          aip.StudySpec.ParameterSpec(
+              parameter_id='learning_rate',
+              double_value_spec=aip.StudySpec.ParameterSpec.DoubleValueSpec(
+                  min_value=1e-3,
+                  max_value=1e-1,
+              ),
+              scale_type=aip.StudySpec.ParameterSpec.ScaleType.UNIT_LOG_SCALE,
+          ),
+          # Add more parameters here as needed:
+          # aip.StudySpec.ParameterSpec(
+          #     parameter_id='per_device_batch_size',
+          #     integer_value_spec=aip.StudySpec.ParameterSpec.IntegerValueSpec(
+          #         min_value=1,
+          #         max_value=8,
+          #     ),
+          # ),
+      ],
+
+      metrics=[
+          aip.StudySpec.MetricSpec(
+              metric_id=_VIZIER_METRIC.value,
+              goal=aip.StudySpec.MetricSpec.GoalType.MINIMIZE,
+          )
+      ],
+  )
+
+
+def create_executor() -> xm_local.VertexTrainingCluster:
+  """Create the VTC executor with MaxText-specific configuration."""
+  container_mounts = [
+      f"{_WORK_DIR.value}:/mnt/jobs",
+  ]
+
+  env_vars = {
+      'NCCL_SOCKET_IFNAME': 'enp0s19,enp192s20',
+      'NCCL_DEBUG': 'VERSION',
+      'CUDA_DEVICE_MAX_CONNECTIONS': '1',
+      'TF_CPP_MIN_LOG_LEVEL': '0',
+      'NVTE_FUSED_ATTN': '1',
+      'JAX_REMOVE_CUSTOM_PARTITIONING_PTR_FROM_CACHE_KEY': 'true',
+      'JAX_ENABLE_PGLE': 'false',
+      'JAX_PLATFORMS': 'cuda',  # Force GPU backend, skip TPU
+      'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.98',
+      'SLURM_NTASKS_PER_NODE': '8',  # Required for JAX multiprocess
+      'XLA_FLAGS': (
+          '--xla_gpu_enable_latency_hiding_scheduler=true '
+          '--xla_gpu_enable_triton_gemm=false '
+          '--xla_gpu_enable_command_buffer=FUSION,CUSTOM_CALL '
+          '--xla_gpu_all_reduce_combine_threshold_bytes=2147483648 '
+          '--xla_gpu_all_gather_combine_threshold_bytes=2147483648 '
+          '--xla_gpu_reduce_scatter_combine_threshold_bytes=16777216 '
+          '--xla_gpu_enable_pipelined_all_gather=true '
+          '--xla_gpu_enable_pipelined_reduce_scatter=true '
+          '--xla_gpu_enable_pipelined_all_reduce=true '
+          '--xla_gpu_enable_while_loop_double_buffering=true '
+          '--xla_gpu_enable_all_gather_combine_by_dim=false '
+          '--xla_gpu_enable_reduce_scatter_combine_by_dim=false '
+          '--xla_disable_hlo_passes=rematerialization'
+      ),
+  }
+
+  # Env vars to pass into container via --container-env
+  # JAX_COORDINATOR_ADDRESS is set by template, others from env_vars
+  container_env_passthrough = [
+      'JAX_COORDINATOR_ADDRESS',
+      'JAX_PLATFORMS',
+      'NCCL_DEBUG',
+      'XLA_FLAGS',
+      'SLURM_NTASKS_PER_NODE',
+  ]
+
+  tensorboard = xm_local.TensorboardCapability(
+      name='',
+      base_output_directory=_GCS_BUCKET.value,
+  )
+
+  return xm_local.VertexTrainingCluster(
+      cluster_type=_CLUSTER_TYPE.value,
+      partition=_PARTITION.value,
+      account=_ACCOUNT.value,
+      time_limit=_TIME_LIMIT.value,
+      requirements=xm.JobRequirements(replicas=_NODES.value),
+      login_node=_LOGIN_NODE.value,
+      use_gcloud_ssh=_USE_GCLOUD_SSH.value,
+      ssh_hostname=_SSH_HOSTNAME.value,
+      work_dir=_WORK_DIR.value,
+      container_image=_CONTAINER_IMAGE.value,
+      container_mounts=container_mounts,
+      container_env_passthrough=container_env_passthrough,
+      setup_jax_coordinator=True,
+      master_port=6002,
+      env_vars=env_vars,
+      stream_output=True,
+      tensorboard=tensorboard,
+      local_files=list(_LOCAL_FILES.value) if _LOCAL_FILES.value else [],
+  )
+
+
+def build_training_args():
+  """Build MaxText training arguments."""
+  return [
+      f'src/MaxText/train.py',
+      _CONFIG_FILE.value,
+      xm.ShellSafeArg(f'steps={_STEPS.value}'),
+      xm.ShellSafeArg(f'base_output_directory=gs://{_GCS_BUCKET.value}'),
+      xm.ShellSafeArg(f'tensorboard_dir=gs://{_GCS_BUCKET.value}/{_CLUSTER_ID.value}/tensorboard/job-${{SLURM_JOB_ID}}'),
+      xm.ShellSafeArg('run_name=job-${SLURM_JOB_ID}'),
+      xm.ShellSafeArg("dataset_path=gs://davidsotomora-asia-southeast1"),
+      xm.ShellSafeArg('packing=False'),
+  ]
 
 def main(_):
-  if not _WORK_DIR.value:
-    raise app.UsageError('--work_dir is required')
+  # Validate required flags
+  if not _GCS_BUCKET.value:
+    raise app.UsageError('--gcs_bucket is required')
+  if not _CLUSTER_ID.value:
+    raise app.UsageError('--cluster_id is required. Find with: gsutil ls gs://<bucket>/')
+  if not _LOGIN_NODE.value:
+    raise app.UsageError('--login_node is required')
+
+  import time
+  timestamp = time.strftime("%Y%m%d-%H%M%S")
 
   print("=" * 60)
-  print("MaxText on Vertex Training Cluster - XManager")
+  print("MaxText Vizier Hyperparameter Optimization")
   print("=" * 60)
+
+  executor = create_executor()
+  cluster_config = executor.get_cluster_config()
+
+  print(f"\nCluster:")
+  print(f"  Type: {cluster_config.cluster_type} ({cluster_config.gpu_type})")
+  print(f"  Nodes: {_NODES.value} ({_NODES.value * cluster_config.gpus_per_node} GPUs)")
+  print(f"  Partition: {_PARTITION.value}")
+
+  print(f"\nPaths:")
+  print(f"  Work dir: {_WORK_DIR.value}")
+  print(f"  Config: {_CONFIG_FILE.value}")
+  print(f"  GCS bucket: gs://{_GCS_BUCKET.value}")
+  print(f"  Cluster ID: {_CLUSTER_ID.value}")
+  if _LOCAL_FILES.value:
+    print(f"  Local files to sync: {_LOCAL_FILES.value}")
+
+  print(f"\nVizier:")
+  print(f"  Project: {_VIZIER_PROJECT.value}")
+  print(f"  Region: {_VIZIER_REGION.value}")
+  print(f"  Trials: {_NUM_TRIALS.value}")
+  print(f"  Parallel: {_NUM_PARALLEL.value}")
+  print(f"  Metric: {_VIZIER_METRIC.value}")
+  print(f"  Steps per trial: {_STEPS.value}")
+
+  if _DRY_RUN.value:
+    print("\n[DRY RUN] Config validated, not submitting")
+    return
 
   with xm_local.create_experiment(
-      experiment_title=f'maxtext_{_RUN_NAME.value}'
+      experiment_title=f'maxtext_vizier_{timestamp}'
   ) as experiment:
 
-    # Build container image path
-    if _IMAGE.value.startswith('/'):
-      container_image = _IMAGE.value
-    else:
-      container_image = f"{_WORK_DIR.value}/{_IMAGE.value}"
-
-    # Prepare local files to rsync
-    local_files = [_CONFIG_FILE.value] + list(_EXTRA_FILES.value)
-
-    # Build container mounts
-    # Format: host_path:container_path[:options]
-    container_mounts = []
-
-    # Mount working directory for configs and outputs
-    container_mounts.append(f"{_WORK_DIR.value}:/workspace/work")
-
-    # Mount data directory if specified
-    if _DATA_DIR.value:
-      container_mounts.append(f"{_DATA_DIR.value}:/data:ro")
-
-    # Mount GCS fuse if available (common on Vertex clusters)
-    container_mounts.append("/gcs:/gcs")
-
-    # Join mounts with comma for srun
-    container_mounts_str = ",".join(container_mounts)
-
-    # Build training command
-    # MaxText train.py reads config.yaml and uses JAX_COORDINATOR_ADDRESS
-    config_basename = _CONFIG_FILE.value.split('/')[-1]
-    train_command = (
-        f"cd {_MAXTEXT_DIR.value} && "
-        f"python {_TRAIN_SCRIPT.value} "
-        f"/workspace/work/{config_basename} "
-        f"run_name={_RUN_NAME.value}"
-    )
-
-    # Add GCS bucket if specified
-    if _GCS_BUCKET.value:
-      train_command += f" base_output_directory={_GCS_BUCKET.value}"
-
-    # Environment variables for JAX
-    env_vars = {
-        # JAX configuration
-        'JAX_PLATFORMS': 'cuda',
-        'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
-        'CUDA_DEVICE_MAX_CONNECTIONS': '1',
-
-        # Logging
-        'TF_CPP_MIN_LOG_LEVEL': '0',
-        'JAX_TRACEBACK_FILTERING': 'off',
-    }
-
-    # Create executor with full configuration
-    executor = xm_local.VertexTrainingCluster(
-        # Cluster settings
-        cluster_type=_CLUSTER_TYPE.value,
-        partition=_PARTITION.value,
-        account=_ACCOUNT.value,
-        time_limit=_TIME_LIMIT.value,
-
-        # Resource requirements (replicas = number of nodes)
-        requirements=xm.JobRequirements(replicas=_NODES.value),
-
-        # Connection settings
-        login_node=_LOGIN_NODE.value,
-        use_gcloud_ssh=_USE_GCLOUD_SSH.value,
-        ssh_hostname=_SSH_HOSTNAME.value,
-
-        # Working directory
-        work_dir=_WORK_DIR.value,
-
-        # Local files to rsync before job submission
-        local_files=local_files,
-
-        # Container configuration
-        container_image=container_image,
-        container_mounts=container_mounts_str,
-
-        # JAX distributed training setup
-        setup_jax_coordinator=True,  # Exports JAX_COORDINATOR_ADDRESS
-        master_port=29500,  # Port for JAX coordinator
-
-        # Environment variables
-        env_vars=env_vars,
-
-        # Log streaming
-        stream_output=_STREAM_OUTPUT.value,
-    )
-
-    # Get cluster configuration for display
-    cluster_config = executor.get_cluster_config()
-
-    print(f"\nConfiguration:")
-    print(f"  Cluster: {cluster_config.cluster_type}")
-    print(f"  GPU: {cluster_config.gpu_type}")
-    print(f"  GPUs per node: {cluster_config.gpus_per_node}")
-    print(f"  Nodes: {_NODES.value}")
-    print(f"  Total GPUs: {_NODES.value * cluster_config.gpus_per_node}")
-    print(f"  Work dir: {_WORK_DIR.value}")
-    print(f"  MaxText dir: {_MAXTEXT_DIR.value}")
-    print(f"  Image: {container_image}")
-    print(f"  Config file: {_CONFIG_FILE.value}")
-    print(f"  Run name: {_RUN_NAME.value}")
-    if _GCS_BUCKET.value:
-      print(f"  GCS bucket: {_GCS_BUCKET.value}")
-    print(f"\nContainer mounts:")
-    for mount in container_mounts:
-      print(f"    {mount}")
-    print(f"\nLocal files to rsync:")
-    for file in local_files:
-      print(f"    {file}")
-    print(f"\nTraining command:")
-    print(f"  {train_command}")
-    print(f"\nEnvironment variables:")
-    for key, value in env_vars.items():
-      print(f"  {key}={value}")
-
-    if _DRY_RUN.value:
-      print("\n[DRY RUN] Configuration validated, not submitting job")
-      return
-
-    if not _LOGIN_NODE.value:
-      print("\n[SKIP] No login_node specified, cannot submit job")
-      print("Add --login_node (and --use_gcloud_ssh if needed) to submit")
-      return
-
-    # Create job with the executor
-    # The Binary represents the training script that will be executed
     job = xm.Job(
-        executable=xm.Binary(
-            path=f"{_MAXTEXT_DIR.value}/{_TRAIN_SCRIPT.value}",
-        ),
-        args=[
-            f"/workspace/work/{config_basename}",
-            f"run_name={_RUN_NAME.value}",
-        ] + ([f"base_output_directory={_GCS_BUCKET.value}"]
-             if _GCS_BUCKET.value else []),
+        executable=xm.Binary(path='python'),
+        args=build_training_args(),
         executor=executor,
     )
 
-    # Add job to experiment - this triggers:
-    # 1. Rsync of local_files to work_dir
-    # 2. Sbatch script generation with JAX coordinator setup
-    # 3. Job submission via sbatch
-    print("\nSubmitting job to Slurm via sbatch...")
-    experiment.add(xm.JobGroup(job=job))
+    # Create Vizier exploration
+    exploration = vizier_cloud.VizierExploration(
+        experiment=experiment,
+        job=job,
+        study_factory=vizier_cloud.NewStudy(
+            study_config=get_study_spec(),
+            project=_VIZIER_PROJECT.value,
+            location=_VIZIER_REGION.value,
+        ),
+        num_trials_total=_NUM_TRIALS.value,
+        num_parallel_trial_runs=_NUM_PARALLEL.value,
+        metric_name=_VIZIER_METRIC.value,
+        gcs_log_base=f'gs://{_GCS_BUCKET.value}',
+        # Don't pass cluster_id - MaxText uses different path pattern
+    )
 
-    print(f"\nExperiment ID: {experiment.experiment_id}")
-    print("\nJob submitted! Use the following to monitor:")
-    print(f"  squeue --me")
-    print(f"  xmanager list")
-    print(f"\nCheckpoints and logs will be saved to: {_GCS_BUCKET.value or 'work_dir'}")
+    print(f"\nStarting Vizier study...")
+    print(f"Monitor: squeue --me")
+    print(f"Vizier: https://console.cloud.google.com/vertex-ai/experiments")
+
+    exploration.launch(poll_frequency_in_sec=60)
+
+    print(f"\nCompleted! Experiment ID: {experiment.experiment_id}")
 
 
 if __name__ == '__main__':

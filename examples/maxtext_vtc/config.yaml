@@ -1,172 +1,150 @@
-# MaxText Training Configuration
-# This is a template configuration file for MaxText training on Vertex Training Cluster.
-# Fill in the values according to your model, data, and training requirements.
+# # MaxText Gemma3-27B Configuration for Vertex Training Cluster
+# # This is an example configuration for running gemma3-27B pretraining on VTC.
+# #
+# # Usage with XManager launcher:
+# #   xmanager launch examples/maxtext_vtc/launcher.py -- \
+# #     --config_file=/mnt/jobs/gemma3-27b.yaml \
+# #     --gcs_bucket=my-bucket \
+# #     --nodes=2 \
+# #     --steps=1000
+# #
+# # Command-line overrides (from launcher) take precedence over this file.
 
-# =============================================================================
-# Model Configuration
-# =============================================================================
-model:
-  # Model architecture name (e.g., 'llama2', 'gpt3', 'palm')
-  name: ''
+# # =============================================================================
+# # Model Configuration
+# # =============================================================================
+# base_config: "base.yml"
+# model_name: gemma3-27b
 
-  # Model size configuration
-  # For predefined sizes (e.g., '7b', '13b', '70b'), or custom parameters below
-  size: ''
+# # =============================================================================
+# # Hardware and Parallelism
+# # =============================================================================
+# hardware: gpu_multiprocess
 
-  # Custom model dimensions (if not using predefined size)
-  num_layers: 0              # Number of transformer layers
-  num_heads: 0               # Number of attention heads
-  num_kv_heads: 0            # Number of key-value heads (for GQA/MQA)
-  embed_dim: 0               # Embedding dimension (d_model)
-  mlp_dim: 0                 # MLP hidden dimension
-  head_dim: 0                # Dimension per attention head
+# # Data parallelism across nodes (DCN = data center network)
+# dcn_data_parallelism: 1
+# dcn_fsdp_parallelism: 2    # Increase for more nodes (e.g., 4 for 4 nodes)
 
-  # Vocabulary and sequence
-  vocab_size: 0              # Vocabulary size
-  max_seq_length: 0          # Maximum sequence length (context window)
+# # Intra-node parallelism (ICI = inter-chip interconnect)
+# ici_fsdp_parallelism: 8     # 8 GPUs per node
 
-  # Architectural choices
-  use_flash_attention: true  # Use FlashAttention for efficiency
-  use_rotary_embedding: true # Use RoPE (Rotary Position Embedding)
-  normalize_embedding_logits: false
-  logits_via_embedding: false
+# # =============================================================================
+# # Training Configuration
+# # =============================================================================
+# per_device_batch_size: 5
+# max_target_length: 8192
+# learning_rate: 0.001        # Tunable via Vizier: --vizier_param=learning_rate:double:1e-5:1e-3:log
 
-# =============================================================================
-# Training Configuration
-# =============================================================================
-training:
-  # Training steps
-  steps: 0                   # Total training steps
-  save_period: 1000          # Checkpoint save frequency (steps)
-  log_period: 10             # Logging frequency (steps)
-  eval_period: 500           # Evaluation frequency (steps)
+# # =============================================================================
+# # Checkpointing
+# # =============================================================================
+# enable_checkpointing: true
+# checkpoint_period: 100
+# async_checkpointing: false
+# save_checkpoint_on_completion: true
+# tensorboard_dir: gs://ai-infra-gcs-europe-west4
 
-  # Batch configuration
-  per_device_batch_size: 0   # Batch size per GPU/TPU device
-  global_batch_size: 0       # Total batch size across all devices
-  # Note: global_batch_size = per_device_batch_size * num_devices * gradient_accumulation_steps
+# # =============================================================================
+# # Model Architecture
+# # =============================================================================
+# attention: cudnn_flash_te
+# remat_policy: full
+# use_iota_embed: true
+# logits_dot_in_fp32: false
+# scan_layers: true
 
-  # Optimization
-  learning_rate: 0.0         # Peak learning rate (e.g., 3e-4)
-  lr_schedule: 'cosine'      # Learning rate schedule: 'cosine', 'linear', 'constant'
-  warmup_steps: 0            # Number of warmup steps
-  end_learning_rate: 0.0     # Final learning rate (for cosine/linear schedules)
+# # =============================================================================
+# # Monitoring
+# # =============================================================================
+# enable_goodput_recording: false
+# monitor_goodput: false
+# save_config_to_gcs: true
 
-  optimizer: 'adamw'         # Optimizer: 'adamw', 'adam', 'sgd'
-  weight_decay: 0.0          # Weight decay coefficient
-  adam_b1: 0.9               # Adam beta1
-  adam_b2: 0.95              # Adam beta2
-  adam_eps: 1.0e-8           # Adam epsilon
-  grad_clip: 1.0             # Gradient clipping threshold
+# # =============================================================================
+# # Dataset Configuration
+# # =============================================================================
+# # Option 1: Synthetic data (for testing)
+# # dataset_type: synthetic
 
-  # Mixed precision
-  dtype: 'bfloat16'          # Data type: 'float32', 'bfloat16', 'float16'
-  enable_checkpointing: true # Enable gradient checkpointing to save memory
+# # Option 2: C4 dataset from GCS
+# dataset_path: gs://maxtext-dataset        # Update to your GCS bucket
+# dataset_type: tfds
+# dataset_name: c4/en:3.0.1
+# train_split: train
+# eval_split: validation
+# eval_tokens: 60000
+# add_bos: false
+# add_eos: false
 
-  # Parallelism strategies
-  ici_tensor_parallelism: 1  # Intra-node tensor parallelism
-  ici_fsdp_parallelism: 1    # Intra-node FSDP (Fully Sharded Data Parallelism)
-  dcn_tensor_parallelism: 1  # Inter-node tensor parallelism
-  dcn_fsdp_parallelism: 1    # Inter-node FSDP
-  # Product of all parallelism values should equal total number of devices
+# # =============================================================================
+# # Vizier-Tunable Parameters (examples)
+# # =============================================================================
+# # These parameters can be overridden via Vizier optimization:
+# #
+# # --vizier_param=learning_rate:double:1e-5:1e-3:log
+# # --vizier_param=per_device_batch_size:int:1:8
+# # --vizier_param=dcn_fsdp_parallelism:int:1:4
+# # --vizier_param=max_target_length:int:2048:8192
+# #
+# # The launcher appends these as CLI args: learning_rate=0.0002 per_device_batch_size=4
+# # CLI args override values in this config file.
 
-  # Random seed
-  seed: 42
 
-# =============================================================================
-# Data Configuration
-# =============================================================================
-data:
-  # Input data paths
-  dataset_name: ''           # Dataset name or identifier
-  dataset_type: ''           # Dataset type: 'tfrecord', 'tfds', 'grain', 'huggingface'
-
-  # Data paths (choose based on dataset_type)
-  tfrecord_path: ''          # Path to TFRecord files (if using tfrecord)
-  grain_train_files: ''      # Path to Grain training files (if using grain)
-  huggingface_path: ''       # HuggingFace dataset path (if using huggingface)
-
-  # Data processing
-  shuffle_buffer_size: 10000 # Shuffle buffer size for data loading
-  num_workers: 8             # Number of data loading workers
-  prefetch_size: 2           # Number of batches to prefetch
-
-  # Tokenization
-  tokenizer_path: ''         # Path to tokenizer model (e.g., SentencePiece model)
-  add_bos: true              # Add beginning-of-sequence token
-  add_eos: true              # Add end-of-sequence token
-
-  # Evaluation data (optional)
-  eval_dataset_name: ''      # Evaluation dataset name
-  eval_split: 'validation'   # Evaluation split
-
-# =============================================================================
-# Output Configuration
-# =============================================================================
-output:
-  # Base output directory (GCS bucket or local path)
-  # This will be set by the launcher via command line args
-  # base_output_directory: 'gs://my-bucket/experiments'
-
-  # Checkpoint settings
-  checkpoint_dir: 'checkpoints'  # Subdirectory for checkpoints (relative to base_output_directory)
-  max_checkpoints_to_keep: 5     # Maximum number of checkpoints to retain
-  save_optimizer_state: true     # Save optimizer state in checkpoints
-
-  # Logging
-  log_dir: 'logs'                # Subdirectory for logs (relative to base_output_directory)
-  tensorboard_dir: 'tensorboard' # Subdirectory for TensorBoard logs
-  enable_profiler: false         # Enable JAX profiler
-  profiler_steps: 5              # Number of steps to profile (if enabled)
-
-# =============================================================================
-# Hardware Configuration
-# =============================================================================
-hardware:
-  # These are typically inferred from the cluster, but can be overridden
-  num_hosts: 0               # Number of nodes (set by launcher via requirements.replicas)
-  num_devices_per_host: 8    # GPUs per node (cluster-specific: 8 for H100/H200/B200)
-
-  # Hardware-specific optimizations
-  enable_xla_optimizations: true
-  xla_flags: ''              # Additional XLA flags (optional)
-
-# =============================================================================
-# Advanced Configuration
-# =============================================================================
-advanced:
-  # Numerical stability
-  numerical_stability: 'high'  # 'high', 'medium', 'low'
-
-  # Communication settings
-  collective_matmul: true
-  latency_optimized_collective_communication: false
-
-  # Debugging
-  log_config_on_startup: true
-  detailed_logging: false
-
-  # Experimental features
-  scan_layers: false         # Use scan over transformer layers
-  remat_policy: 'minimal'    # Rematerialization policy: 'none', 'minimal', 'full'
-
-# =============================================================================
-# Notes
-# =============================================================================
-# 1. The run_name and base_output_directory are typically passed via command
-#    line arguments by the XManager launcher.
+# Copyright 2024 Google LLC
 #
-# 2. Adjust parallelism settings based on your hardware:
-#    - For single-node: Use ici_fsdp_parallelism = num_gpus
-#    - For multi-node: Distribute across ici_* and dcn_* dimensions
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-# 3. Memory optimization tips:
-#    - Reduce per_device_batch_size if OOM
-#    - Enable gradient checkpointing (enable_checkpointing: true)
-#    - Use bfloat16 dtype
-#    - Increase FSDP parallelism
+#      https://www.apache.org/licenses/LICENSE-2.0
 #
-# 4. Common cluster configurations:
-#    - hcc-a4 (B200): 8 GPUs per node, 192GB HBM3e per GPU
-#    - hcc-a3u (H200): 8 GPUs per node, 141GB HBM3e per GPU
-#    - hcc-a3m (H100): 8 GPUs per node, 80GB HBM3 per GPU
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+base_config: "base.yml"
+model_name: llama3.1-70b
+
+hardware: gpu_multiprocess
+dcn_data_parallelism: 1
+dcn_fsdp_parallelism: 2
+ici_fsdp_parallelism: 8
+per_device_batch_size: 1
+max_target_length: 8192
+learning_rate: 0.001
+enable_checkpointing: true
+checkpoint_period: 10
+async_checkpointing: true
+save_checkpoint_on_completion: true
+attention: cudnn_flash_te
+remat_policy: full
+use_iota_embed: true
+logits_dot_in_fp32: false
+scan_layers: True
+enable_goodput_recording: false
+monitor_goodput: false
+save_config_to_gcs: true
+tensorboard_dir: gs://ai-infra-gcs-europe-west4
+
+# Dataset Configration
+
+# Option1: Synthetic
+# dataset_type: synthetic
+
+# Option2: c4en dataset
+dataset_path: gs://checkpoint-dsm-a3-ultra-4f4d88d2
+dataset_type: tfds
+dataset_name: c4/en:3.0.1
+train_split: train
+eval_split: validation
+eval_tokens: 60000
+add_bos: false
+add_eos: false
+
+# # Vertex AI Tensorboard Logging
+# use_vertex_tensorboard: True
+# vertex_tensorboard_project: "ai-infra-recipe-validation"
+# # Vertex AI supported regions: https://cloud.google.com/vertex-ai/docs/general/locations#available-regions
+# vertex_tensorboard_region: "us-west1"
