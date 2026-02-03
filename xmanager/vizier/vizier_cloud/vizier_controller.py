@@ -14,12 +14,14 @@
 """Main code that the Vertex Cloud Vizier Controller runs."""
 
 import asyncio
+import logging
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from google.cloud import aiplatform_v1beta1 as aip
 
 from xmanager import xm
+from xmanager.vizier.vizier_cloud import vizier_worker
 
 # Type alias for metric fetcher callback
 # Takes a work unit and returns Optional[(step, value)] or list of (step, value)
@@ -67,76 +69,66 @@ class VizierController:
     self._metric_fetcher = metric_fetcher
     self._metric_id = metric_id
 
-    self._work_unit_updaters = []
-    # Counter incremented synchronously to avoid race condition with async
-    # work unit creation. This tracks how many work units we've requested,
-    # even if the async callbacks haven't completed yet.
-    self._num_work_units_requested = 0
+    self._work_unit_updaters: List[WorkUnitVizierUpdater] = []
 
   def run(self, poll_frequency_in_sec: float = 60) -> None:
-    """Peridically check and sync status between vizier and work units and create new work units when needed."""
+    """Periodically check and sync status between vizier and work units."""
+    # Use the experiment's event loop to avoid loop mismatch.
+    # The Experiment class runs its own event loop in a background thread,
+    # so we schedule our async work there using run_coroutine_threadsafe.
+    loop = self._experiment._event_loop
+    future = asyncio.run_coroutine_threadsafe(
+        self._run_async(poll_frequency_in_sec), loop
+    )
+    # Block until the async work completes
+    future.result()
+
+  async def _run_async(self, poll_frequency_in_sec: float) -> None:
+    """Async implementation of the run loop."""
     while True:
       # 1. Complete trial for completed work unit; Early stop first if needed.
       for work_unit_updater in self._work_unit_updaters:
         if not work_unit_updater.completed:
           work_unit_updater.check_for_completion()
 
-      # 2. TODO: Return by Vizier's indication that study is done
-      # when such API is ready on Vizier side.
+      # 2. Check if all work units are done
+      num_existing_work_units = len(self._work_unit_updaters)
       num_completed_work_units = sum(
           [wuu.completed for wuu in self._work_unit_updaters]
       )
       if (
-          self._num_work_units_requested == self._num_work_units_total
+          num_existing_work_units == self._num_work_units_total
           and num_completed_work_units == self._num_work_units_total
       ):
-        print('All done! Exiting VizierController... \n')
+        logging.info('All done! Exiting VizierController...')
         return
 
       # 3. Get new trials and assign to new work units.
-      self._launch_new_work_units()
+      await self._launch_new_work_units()
 
-      # Use asyncio.sleep instead of time.sleep to allow the event loop
-      # to process async callbacks (like experiment.add completion).
-      # This is critical in notebook environments with nest_asyncio.
-      try:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(asyncio.sleep(poll_frequency_in_sec))
-      except RuntimeError:
-        # Fallback to time.sleep if no event loop available
-        time.sleep(poll_frequency_in_sec)
+      # Sleep to allow event loop processing
+      await asyncio.sleep(poll_frequency_in_sec)
 
-  def _launch_new_work_units(self) -> None:
-    """Get hyperparmeter suggestions from Vizier and assign to new work units to run."""
-    # 1. Compute num of work units to create next.
-    # Use _num_work_units_requested (sync counter) instead of len(_work_unit_updaters)
-    # to avoid race condition with async work unit creation callbacks.
-    num_existing_work_units = self._num_work_units_requested
-
-    # Count "pending" work units (requested but async callback not yet completed)
-    # These must be treated as "in flight" to avoid creating duplicates.
-    num_pending_work_units = (
-        self._num_work_units_requested - len(self._work_unit_updaters)
-    )
-
-    # Count confirmed work units that haven't completed yet
-    # This includes both PENDING (queued in Slurm) and RUNNING jobs
+  async def _launch_new_work_units(self) -> None:
+    """Get hyperparameter suggestions from Vizier and assign to new work units."""
+    # Count existing and in-flight work units
+    num_existing_work_units = len(self._work_unit_updaters)
     num_not_completed = len(
         [wuu for wuu in self._work_unit_updaters if not wuu.completed]
     )
-
-    # Total "in flight" = pending (not yet confirmed) + not completed
-    num_in_flight = num_pending_work_units + num_not_completed
 
     num_work_units_to_create_total = (
         self._num_work_units_total - num_existing_work_units
     )
     num_work_units_to_create_next = min(
-        self._num_parallel_work_units - num_in_flight,
+        self._num_parallel_work_units - num_not_completed,
         num_work_units_to_create_total,
     )
 
-    # 2. Create the work units.
+    if num_work_units_to_create_next <= 0:
+      return
+
+    # Create work units sequentially, awaiting each one
     start_index = num_existing_work_units + 1
     for i in range(start_index, start_index + num_work_units_to_create_next):
       trial = (
@@ -150,41 +142,51 @@ class VizierController:
           .result()
           .trials[0]
       )
-      print(f'Trial for work unit (index: {i}) is retrieved：\n{trial}')
+      logging.info('Trial for work unit (index: %d) is retrieved: %s', i, trial)
+      logging.info('Creating work unit (index: %d)...', i)
 
-      print(f'Creating work unit (index: {i})... \n')
+      # Create work unit and await completion
+      work_unit = await self._create_work_unit(i, trial)
 
-      def create_gen(index: int, trial: aip.Trial) -> xm.JobGeneratorType:
-        async def gen_work_unit(work_unit: xm.WorkUnit, **kwargs):
-          await self._work_unit_generator(work_unit, kwargs)
+      logging.info(
+          'Work unit (index: %d, id: %s) created.',
+          i,
+          work_unit.work_unit_id,
+      )
 
-          # TODO: Add an utility to handle logging conditionally
-          # (use print when run local otherwise logging.info.)
-          print(
-              f'Work unit (index: {index}, '
-              f'id: {work_unit.work_unit_id}) created. \n'
+      self._work_unit_updaters.append(
+          WorkUnitVizierUpdater(
+              vz_client=self._vz_client,
+              work_unit=work_unit,
+              trial=trial,
+              metric_fetcher=self._metric_fetcher,
+              metric_id=self._metric_id,
           )
-          self._work_unit_updaters.append(
-              WorkUnitVizierUpdater(
-                  vz_client=self._vz_client,
-                  work_unit=work_unit,
-                  trial=trial,
-                  metric_fetcher=self._metric_fetcher,
-                  metric_id=self._metric_id,
-              )
-          )
+      )
 
-        return gen_work_unit
+  async def _create_work_unit(
+      self, index: int, trial: aip.Trial
+  ) -> xm.WorkUnit:
+    """Create a single work unit for a trial.
 
-      args = {
-          'trial_name': trial.name,
-          **{p.parameter_id: p.value for p in trial.parameters},
-      }
-      # Increment counter BEFORE experiment.add() to avoid race condition.
-      # The async callback in create_gen populates _work_unit_updaters later,
-      # but we need to track the request count synchronously.
-      self._num_work_units_requested += 1
-      self._experiment.add(create_gen(i, trial), args)
+    Args:
+      index: The work unit index.
+      trial: The Vizier trial with suggested parameters.
+
+    Returns:
+      The created WorkUnit.
+    """
+    args = {
+        'trial_name': trial.name,
+        **{p.parameter_id: p.value for p in trial.parameters},
+    }
+
+    async def gen_work_unit(work_unit: xm.WorkUnit, **kwargs):
+      await self._work_unit_generator(work_unit, kwargs)
+
+    # Await the experiment.add() to ensure work unit is fully created
+    work_unit = await self._experiment.add(gen_work_unit, args)
+    return work_unit
 
 
 class WorkUnitVizierUpdater:
@@ -199,14 +201,32 @@ class WorkUnitVizierUpdater:
       metric_id: Optional[str] = None,
   ) -> None:
     self.completed = False
-    self._vz_client = vz_client
+    self._vz_client = vz_client  # Still needed for early stopping check
     self._work_unit = work_unit
     self._trial = trial
     self._metric_fetcher = metric_fetcher
     self._metric_id = metric_id
 
+    # Use VizierWorker for metric reporting and trial completion
+    self._worker = vizier_worker.VizierWorker(trial.name)
+
   def work_unit_status(self) -> xm.ExperimentUnitStatus:
     return self._work_unit.get_status()
+
+  def _is_pending(self, status: xm.ExperimentUnitStatus) -> bool:
+    """Check if the status indicates a pending/queued state.
+
+    Args:
+      status: The experiment unit status.
+
+    Returns:
+      True if the job is pending (queued but not yet running).
+    """
+    # Use public is_pending property if available
+    if hasattr(status, 'is_pending'):
+      return status.is_pending
+    # Fallback: if not active and not completed/failed, assume pending
+    return not status.is_active
 
   def check_for_completion(self) -> None:
     """Sync the completion status between WorkUnit and Vizier Trial if needed."""
@@ -217,7 +237,7 @@ class WorkUnitVizierUpdater:
 
     # Check if job is running
     if status.is_active:
-      print(f'Work unit {self._work_unit.work_unit_id} is running.\n')
+      logging.info('Work unit %s is running.', self._work_unit.work_unit_id)
 
       # Fetch intermediate metrics for early stopping / progress
       if self._metric_fetcher and self._metric_id:
@@ -233,23 +253,21 @@ class WorkUnitVizierUpdater:
           .result()
           .should_stop
       ):
-        print(f'Early stopping work unit {self._work_unit.work_unit_id}.\n')
+        logging.info(
+            'Early stopping work unit %s.', self._work_unit.work_unit_id
+        )
         self._work_unit.stop()
       return
 
-    # Job is not active - check if PENDING or finished
-    # Import here to avoid circular imports
-    from xmanager.xm_local.status import LocalWorkUnitStatusEnum
-
-    if (
-        hasattr(status, '_status')
-        and status._status == LocalWorkUnitStatusEnum.PENDING
-    ):
-      print(f'Work unit {self._work_unit.work_unit_id} is pending/queuing.\n')
+    # Check if job is pending (queued but not running)
+    if self._is_pending(status):
+      logging.info(
+          'Work unit %s is pending/queuing.', self._work_unit.work_unit_id
+      )
       return
 
     # Job finished (COMPLETED, FAILED, CANCELLED, UNKNOWN)
-    print(f'Work unit {self._work_unit.work_unit_id} has finished.\n')
+    logging.info('Work unit %s has finished.', self._work_unit.work_unit_id)
 
     # Fetch final metrics with retry
     metrics_reported = False
@@ -274,21 +292,25 @@ class WorkUnitVizierUpdater:
     try:
       metrics = self._metric_fetcher(self._work_unit)
       if not metrics:
-        print(f'No metrics found for work unit {self._work_unit.work_unit_id}.\n')
+        logging.info(
+            'No metrics found for work unit %s.', self._work_unit.work_unit_id
+        )
         return False
 
       for step, value in metrics:
         self._report_measurement(step, value)
 
-      print(
-          f'Reported {len(metrics)} measurement(s) for work unit '
-          f'{self._work_unit.work_unit_id}.\n'
+      logging.info(
+          'Reported %d measurement(s) for work unit %s.',
+          len(metrics),
+          self._work_unit.work_unit_id,
       )
       return True
     except Exception as e:
-      print(
-          f'Error fetching metrics for work unit '
-          f'{self._work_unit.work_unit_id}: {e}\n'
+      logging.warning(
+          'Error fetching metrics for work unit %s: %s',
+          self._work_unit.work_unit_id,
+          e,
       )
       return False
 
@@ -308,9 +330,11 @@ class WorkUnitVizierUpdater:
       if self._fetch_and_report_metrics():
         return True
       if attempt < max_retries - 1:
-        print(
-            f'Retrying metric fetch in {delay}s '
-            f'(attempt {attempt + 2}/{max_retries})...\n'
+        logging.info(
+            'Retrying metric fetch in %.0fs (attempt %d/%d)...',
+            delay,
+            attempt + 2,
+            max_retries,
         )
         time.sleep(delay)
     return False
@@ -322,30 +346,11 @@ class WorkUnitVizierUpdater:
       step: The training step for this measurement.
       value: The metric value at this step.
     """
-    self._vz_client.add_trial_measurement(
-        request=aip.AddTrialMeasurementRequest(
-            trial_name=self._trial.name,
-            measurement=aip.Measurement(
-                step_count=step,
-                metrics=[
-                    aip.Measurement.Metric(
-                        metric_id=self._metric_id,
-                        value=value,
-                    )
-                ],
-            ),
-        )
-    )
+    self._worker.add_trial_measurement(step, {self._metric_id: value})
 
   def _complete_trial(
       self, trial: aip.Trial, infeasible_reason: Optional[str] = None
   ) -> None:
     """Complete a trial."""
-    self._vz_client.complete_trial(
-        request=aip.CompleteTrialRequest(
-            name=trial.name,
-            trial_infeasible=infeasible_reason is not None,
-            infeasible_reason=infeasible_reason,
-        )
-    )
-    print(f'Trial {trial.name} is completed\n')
+    del trial  # Not needed - worker already has trial name
+    self._worker.complete_trial(infeasible_reason)

@@ -17,6 +17,7 @@ This module provides functionality to read TensorBoard event files from GCS
 and extract scalar metrics for use with Vizier hyperparameter optimization.
 """
 
+import logging
 import os
 import tempfile
 from typing import List, Optional, Tuple
@@ -171,8 +172,11 @@ class GCSMetricReader:
         # Don't break - prefer exact match
 
     if not matching_tag:
-      print(f"Warning: Metric '{self._metric_name}' not found. "
-            f"Available metrics: {available_tags}")
+      logging.warning(
+          "Metric '%s' not found. Available metrics: %s",
+          self._metric_name,
+          available_tags,
+      )
       return []
 
     # Extract scalar values
@@ -193,7 +197,7 @@ class GCSMetricReader:
         # Download event files
         local_files = self._download_event_files(temp_dir)
         if not local_files:
-          print(f"No event files found at {self._gcs_path}")
+          logging.info("No event files found at %s", self._gcs_path)
           return None
 
         # Parse events
@@ -205,7 +209,7 @@ class GCSMetricReader:
         return max(metrics, key=lambda x: x[0])
 
     except Exception as e:
-      print(f"Error reading metrics from GCS: {e}")
+      logging.warning("Error reading metrics from GCS: %s", e)
       return None
 
   def get_all_metrics(self) -> List[Tuple[int, float]]:
@@ -227,7 +231,7 @@ class GCSMetricReader:
         return sorted(metrics, key=lambda x: x[0])
 
     except Exception as e:
-      print(f"Error reading metrics from GCS: {e}")
+      logging.warning("Error reading metrics from GCS: %s", e)
       return []
 
   def get_new_metrics(self) -> List[Tuple[int, float]]:

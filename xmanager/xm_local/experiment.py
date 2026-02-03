@@ -165,6 +165,19 @@ class LocalExperimentUnit(xm.ExperimentUnit):
         'implemented yet.'
     )
 
+  def get_execution_handles(
+      self,
+  ) -> List[execution_handles.ExecutionHandle]:
+    """Returns the non-local execution handles for this experiment unit.
+
+    This provides access to executor-specific handles (e.g., VTC handles
+    with slurm_job_id) for integration with external systems like Vizier.
+
+    Returns:
+      List of non-local execution handles.
+    """
+    return list(self._non_local_execution_handles)
+
 
 class LocalWorkUnit(LocalExperimentUnit):
   """A work unit operated by the local backend."""

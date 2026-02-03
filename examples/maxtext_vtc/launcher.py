@@ -12,179 +12,100 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""XManager launcher for MaxText Vizier hyperparameter optimization on VTC.
+r"""Simplified XManager launcher for MaxText + Vizier on VTC.
 
-This launcher runs Vertex AI Vizier hyperparameter optimization for MaxText
-training jobs on Slurm-based Vertex Training Clusters.
-
-Features:
-  - JAX distributed training with automatic coordinator setup
-  - Vertex AI Vizier for Bayesian hyperparameter optimization
-  - GCS-based metric reading from TensorBoard logs
-  - Uses ADC (Application Default Credentials) for project/region
-  - Local file sync via --local_files (rsync to work_dir before job submission)
+Tests VTC + Vizier integration with minimal configuration.
 
 Usage:
   xmanager launch examples/maxtext_vtc/launcher.py -- \
-    --cluster_type=hcc-a3u \
-    --partition=a3u \
     --login_node=vmdsa3u04-login-001 \
     --use_gcloud_ssh \
     --ssh_hostname=nic0.vmdsa3u04-login-001.europe-west4-a.c.ai-infra-recipe-validation.internal.gcpnode.com \
-    --work_dir=/home/abhishekbhgwt_google_com/vertexai-mds/nemo \
-    --container_image=/mnt/lustre/ls1-europe-west4-a/images/jax-maxtext-2025-10-01.sqsh \
-    --config_file=/mnt/jobs/config.yaml \
     --gcs_bucket=ai-infra-gcs-europe-west4 \
-    --cluster_id=vmdsa3u04-7070932889948389376 \
+    --cluster_type=hcc-a3u \
+    --partition=a3u \
     --nodes=2 \
-    --num_trials=5
+    --num_trials=2 \
+    --steps=10
 
-To copy local config files to the cluster:
-  --local_files=./gemma3-27b.yaml --local_files=./another-config.yaml
-
-To find your cluster_id:
-  gsutil ls gs://<your-bucket>/
+TensorBoard logs are written to:
+  gs://{bucket}/job-{slurm_job_id}/tensorboard/job-{slurm_job_id}/
 """
 
-from google.cloud import aiplatform_v1beta1 as aip
+import time
 
 from absl import app
 from absl import flags
+from google.cloud import aiplatform_v1beta1 as aip
+
 from xmanager import xm
 from xmanager import xm_local
 from xmanager.vizier import vizier_cloud
 
-# =============================================================================
-# Cluster Configuration
-# =============================================================================
-_CLUSTER_TYPE = flags.DEFINE_string(
-    'cluster_type', 'hcc-a3u',
-    'Cluster type: hcc-a3m, hcc-a3u, hcc-a4, hcc-a3h')
-_PARTITION = flags.DEFINE_string('partition', 'a3u', 'Slurm partition')
-_ACCOUNT = flags.DEFINE_string('account', None, 'Slurm account (optional)')
-_NODES = flags.DEFINE_integer('nodes', 2, 'Number of nodes')
-_TIME_LIMIT = flags.DEFINE_string('time_limit', None, 'Time limit (e.g., "1:00:00")')
+# Required flags
+_LOGIN_NODE = flags.DEFINE_string('login_node', None, 'SSH login node (required)')
+_GCS_BUCKET = flags.DEFINE_string('gcs_bucket', None, 'GCS bucket name (required)')
 
-# =============================================================================
-# Paths and Container
-# =============================================================================
+# Cluster config (with sensible defaults)
+_CLUSTER_TYPE = flags.DEFINE_string('cluster_type', 'hcc-a3u', 'Cluster type')
+_PARTITION = flags.DEFINE_string('partition', 'a3u', 'Slurm partition')
+_NODES = flags.DEFINE_integer('nodes', 2, 'Number of nodes')
+
+# Paths (with defaults)
 _WORK_DIR = flags.DEFINE_string(
-    'work_dir', '/home/abhishekbhgwt_google_com/vertexai-mds/maxtext',
-    'Working directory on cluster (required)')
-_MAXTEXT_DIR = flags.DEFINE_string(
-    'maxtext_dir', '/workspace/MaxText',
-    'MaxText installation directory in container')
+    'work_dir', '/home/abhishekbhgwt_google_com/vertexai-mds/nemo', 'Work dir on cluster')
 _CONTAINER_IMAGE = flags.DEFINE_string(
     'container_image', '/mnt/lustre/ls1-europe-west4-a/images/jax-maxtext-2025-10-01.sqsh',
-    'Container image path (.sqsh) on cluster')
+    'Container image path')
 _CONFIG_FILE = flags.DEFINE_string(
-    'config_file', '/mnt/jobs/gemma3-27b.yaml',
-    'Path to MaxText config file on cluster')
+    'config_file', '/mnt/jobs/config.yaml', 'MaxText config file')
 
-# =============================================================================
-# GCS Configuration
-# =============================================================================
-_GCS_BUCKET = flags.DEFINE_string(
-    'gcs_bucket', None, 'GCS bucket name (required, e.g., my-bucket)')
-_CLUSTER_ID = flags.DEFINE_string(
-    'cluster_id', None,
-    'Cluster ID for GCS paths (required). Find with: gsutil ls gs://<bucket>/')
-
-# =============================================================================
-# Training Configuration
-# =============================================================================
-_STEPS = flags.DEFINE_integer('steps', 10, 'Training steps per trial')
-
-# =============================================================================
-# Connection
-# =============================================================================
-_LOGIN_NODE = flags.DEFINE_string('login_node', None, 'SSH login node (required)')
-_USE_GCLOUD_SSH = flags.DEFINE_bool('use_gcloud_ssh', False, 'Use gcloud compute ssh')
+# SSH options
+_USE_GCLOUD_SSH = flags.DEFINE_bool('use_gcloud_ssh', True, 'Use gcloud compute ssh')
 _SSH_HOSTNAME = flags.DEFINE_string('ssh_hostname', None, 'SSH hostname override')
 
-# =============================================================================
-# Vizier Configuration
-# =============================================================================
-_NUM_TRIALS = flags.DEFINE_integer('num_trials', 5, 'Number of Vizier trials')
+# Training/Vizier config
+_STEPS = flags.DEFINE_integer('steps', 10, 'Training steps per trial')
+_NUM_TRIALS = flags.DEFINE_integer('num_trials', 2, 'Number of Vizier trials')
 _NUM_PARALLEL = flags.DEFINE_integer('num_parallel', 1, 'Parallel trials')
-_VIZIER_METRIC = flags.DEFINE_string(
-    'metric', 'learning/loss', 'Metric to optimize from TensorBoard')
-_VIZIER_PROJECT = flags.DEFINE_string(
-    'vizier_project', 'ai-infra-recipe-validation',
-    'GCP project for Vizier study (overrides ADC)')
-_VIZIER_REGION = flags.DEFINE_string(
-    'vizier_region', 'europe-west4',
-    'GCP region for Vizier study (overrides ADC)')
+_METRIC = flags.DEFINE_string('metric', 'learning/loss', 'Metric to optimize')
 
-# =============================================================================
-# Local Files (rsync to work_dir before submission)
-# =============================================================================
-_LOCAL_FILES = flags.DEFINE_multi_string(
-    'local_files', [],
-    'Local files/directories to rsync to work_dir before submission '
-    '(e.g., config files)')
+# Vizier project/region
+_PROJECT = flags.DEFINE_string('project', 'ai-infra-recipe-validation', 'GCP project')
+_REGION = flags.DEFINE_string('region', 'europe-west4', 'GCP region')
 
-# =============================================================================
-# Other
-# =============================================================================
+# Debug
 _DRY_RUN = flags.DEFINE_bool('dry_run', False, 'Validate config without submitting')
 
 
-def get_study_spec() -> aip.StudySpec:
-  """Define the Vizier study specification.
+def main(_):
+  # Validate required flags
+  missing = []
+  if not _LOGIN_NODE.value:
+    missing.append('--login_node')
+  if not _GCS_BUCKET.value:
+    missing.append('--gcs_bucket')
+  if missing:
+    raise app.UsageError(f'Missing required flags: {", ".join(missing)}')
 
-  Modify this function to change the hyperparameters being optimized.
-  """
-  return aip.StudySpec(
-      # Let Vizier choose the algorithm (typically Bayesian optimization)
-      algorithm=aip.StudySpec.Algorithm.ALGORITHM_UNSPECIFIED,
+  timestamp = time.strftime('%Y%m%d-%H%M%S')
 
-      parameters=[
-          # Learning rate: log-scale search from 1e-5 to 1e-3
-          aip.StudySpec.ParameterSpec(
-              parameter_id='learning_rate',
-              double_value_spec=aip.StudySpec.ParameterSpec.DoubleValueSpec(
-                  min_value=1e-3,
-                  max_value=1e-1,
-              ),
-              scale_type=aip.StudySpec.ParameterSpec.ScaleType.UNIT_LOG_SCALE,
-          ),
-          # Add more parameters here as needed:
-          # aip.StudySpec.ParameterSpec(
-          #     parameter_id='per_device_batch_size',
-          #     integer_value_spec=aip.StudySpec.ParameterSpec.IntegerValueSpec(
-          #         min_value=1,
-          #         max_value=8,
-          #     ),
-          # ),
-      ],
-
-      metrics=[
-          aip.StudySpec.MetricSpec(
-              metric_id=_VIZIER_METRIC.value,
-              goal=aip.StudySpec.MetricSpec.GoalType.MINIMIZE,
-          )
-      ],
-  )
-
-
-def create_executor() -> xm_local.VertexTrainingCluster:
-  """Create the VTC executor with MaxText-specific configuration."""
-  container_mounts = [
-      f"{_WORK_DIR.value}:/mnt/jobs",
-  ]
-
+  # JAX/XLA environment variables for distributed training
   env_vars = {
+      # NCCL configuration
       'NCCL_SOCKET_IFNAME': 'enp0s19,enp192s20',
       'NCCL_DEBUG': 'VERSION',
       'CUDA_DEVICE_MAX_CONNECTIONS': '1',
-      'TF_CPP_MIN_LOG_LEVEL': '0',
-      'NVTE_FUSED_ATTN': '1',
+      # JAX configuration
+      'JAX_PLATFORMS': 'cuda',
       'JAX_REMOVE_CUSTOM_PARTITIONING_PTR_FROM_CACHE_KEY': 'true',
       'JAX_ENABLE_PGLE': 'false',
-      'JAX_PLATFORMS': 'cuda',  # Force GPU backend, skip TPU
+      'SLURM_NTASKS_PER_NODE': '8',  # Required for JAX multiprocess (8 GPUs/node)
+      # XLA/TensorFlow configuration
+      'TF_CPP_MIN_LOG_LEVEL': '0',
       'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.98',
-      'SLURM_NTASKS_PER_NODE': '8',  # Required for JAX multiprocess
+      'NVTE_FUSED_ATTN': '1',
+      # XLA optimization flags
       'XLA_FLAGS': (
           '--xla_gpu_enable_latency_hiding_scheduler=true '
           '--xla_gpu_enable_triton_gemm=false '
@@ -202,8 +123,7 @@ def create_executor() -> xm_local.VertexTrainingCluster:
       ),
   }
 
-  # Env vars to pass into container via --container-env
-  # JAX_COORDINATOR_ADDRESS is set by template, others from env_vars
+  # Env vars to pass into container
   container_env_passthrough = [
       'JAX_COORDINATOR_ADDRESS',
       'JAX_PLATFORMS',
@@ -212,123 +132,108 @@ def create_executor() -> xm_local.VertexTrainingCluster:
       'SLURM_NTASKS_PER_NODE',
   ]
 
-  tensorboard = xm_local.TensorboardCapability(
-      name='',
-      base_output_directory=_GCS_BUCKET.value,
-  )
-
-  return xm_local.VertexTrainingCluster(
+  # Create executor
+  executor = xm_local.VertexTrainingCluster(
       cluster_type=_CLUSTER_TYPE.value,
       partition=_PARTITION.value,
-      account=_ACCOUNT.value,
-      time_limit=_TIME_LIMIT.value,
       requirements=xm.JobRequirements(replicas=_NODES.value),
       login_node=_LOGIN_NODE.value,
       use_gcloud_ssh=_USE_GCLOUD_SSH.value,
       ssh_hostname=_SSH_HOSTNAME.value,
       work_dir=_WORK_DIR.value,
       container_image=_CONTAINER_IMAGE.value,
-      container_mounts=container_mounts,
+      container_mounts=[f'{_WORK_DIR.value}:/mnt/jobs'],
       container_env_passthrough=container_env_passthrough,
       setup_jax_coordinator=True,
-      master_port=6002,
       env_vars=env_vars,
       stream_output=True,
-      tensorboard=tensorboard,
-      local_files=list(_LOCAL_FILES.value) if _LOCAL_FILES.value else [],
+      tensorboard=xm_local.TensorboardCapability(
+          name='',
+          base_output_directory=_GCS_BUCKET.value,
+      ),
   )
 
+  # Print config
+  config = executor.get_cluster_config()
+  print(f'\n{"="*60}')
+  print(f'MaxText + Vizier Integration Test')
+  print(f'{"="*60}')
+  print(f'Cluster: {config.cluster_type} ({config.gpu_type})')
+  print(f'Nodes: {_NODES.value} ({_NODES.value * config.gpus_per_node} GPUs)')
+  print(f'GCS: gs://{_GCS_BUCKET.value}/')
+  print(f'Vizier: {_NUM_TRIALS.value} trials, metric={_METRIC.value}')
+  print(f'{"="*60}\n')
 
-def build_training_args():
-  """Build MaxText training arguments."""
-  return [
-      f'src/MaxText/train.py',
+  if _DRY_RUN.value:
+    print('[DRY RUN] Config validated, not submitting')
+    return
+
+  # Build training args
+  # TensorBoard path pattern: gs://{bucket}/job-{slurm_job_id}/tensorboard/job-{slurm_job_id}/
+  # This matches the default MaxText pattern in VizierExploration
+  training_args = [
+      'src/MaxText/train.py',
       _CONFIG_FILE.value,
       xm.ShellSafeArg(f'steps={_STEPS.value}'),
       xm.ShellSafeArg(f'base_output_directory=gs://{_GCS_BUCKET.value}'),
-      xm.ShellSafeArg(f'tensorboard_dir=gs://{_GCS_BUCKET.value}/{_CLUSTER_ID.value}/tensorboard/job-${{SLURM_JOB_ID}}'),
+      xm.ShellSafeArg(f'tensorboard_dir=gs://{_GCS_BUCKET.value}/job-${{SLURM_JOB_ID}}/tensorboard/job-${{SLURM_JOB_ID}}'),
       xm.ShellSafeArg('run_name=job-${SLURM_JOB_ID}'),
-      xm.ShellSafeArg("dataset_path=gs://davidsotomora-asia-southeast1"),
       xm.ShellSafeArg('packing=False'),
   ]
 
-def main(_):
-  # Validate required flags
-  if not _GCS_BUCKET.value:
-    raise app.UsageError('--gcs_bucket is required')
-  if not _CLUSTER_ID.value:
-    raise app.UsageError('--cluster_id is required. Find with: gsutil ls gs://<bucket>/')
-  if not _LOGIN_NODE.value:
-    raise app.UsageError('--login_node is required')
+  # Vizier study spec
+  study_spec = aip.StudySpec(
+      algorithm=aip.StudySpec.Algorithm.ALGORITHM_UNSPECIFIED,
+      parameters=[
+          aip.StudySpec.ParameterSpec(
+              parameter_id='learning_rate',
+              double_value_spec=aip.StudySpec.ParameterSpec.DoubleValueSpec(
+                  min_value=1e-3, max_value=1e-1,
+              ),
+              scale_type=aip.StudySpec.ParameterSpec.ScaleType.UNIT_LOG_SCALE,
+          ),
+      ],
+      metrics=[
+          aip.StudySpec.MetricSpec(
+              metric_id=_METRIC.value,
+              goal=aip.StudySpec.MetricSpec.GoalType.MINIMIZE,
+          )
+      ],
+  )
 
-  import time
-  timestamp = time.strftime("%Y%m%d-%H%M%S")
-
-  print("=" * 60)
-  print("MaxText Vizier Hyperparameter Optimization")
-  print("=" * 60)
-
-  executor = create_executor()
-  cluster_config = executor.get_cluster_config()
-
-  print(f"\nCluster:")
-  print(f"  Type: {cluster_config.cluster_type} ({cluster_config.gpu_type})")
-  print(f"  Nodes: {_NODES.value} ({_NODES.value * cluster_config.gpus_per_node} GPUs)")
-  print(f"  Partition: {_PARTITION.value}")
-
-  print(f"\nPaths:")
-  print(f"  Work dir: {_WORK_DIR.value}")
-  print(f"  Config: {_CONFIG_FILE.value}")
-  print(f"  GCS bucket: gs://{_GCS_BUCKET.value}")
-  print(f"  Cluster ID: {_CLUSTER_ID.value}")
-  if _LOCAL_FILES.value:
-    print(f"  Local files to sync: {_LOCAL_FILES.value}")
-
-  print(f"\nVizier:")
-  print(f"  Project: {_VIZIER_PROJECT.value}")
-  print(f"  Region: {_VIZIER_REGION.value}")
-  print(f"  Trials: {_NUM_TRIALS.value}")
-  print(f"  Parallel: {_NUM_PARALLEL.value}")
-  print(f"  Metric: {_VIZIER_METRIC.value}")
-  print(f"  Steps per trial: {_STEPS.value}")
-
-  if _DRY_RUN.value:
-    print("\n[DRY RUN] Config validated, not submitting")
-    return
-
+  # Run experiment
   with xm_local.create_experiment(
       experiment_title=f'maxtext_vizier_{timestamp}'
   ) as experiment:
 
     job = xm.Job(
         executable=xm.Binary(path='python'),
-        args=build_training_args(),
+        args=training_args,
         executor=executor,
     )
 
-    # Create Vizier exploration
     exploration = vizier_cloud.VizierExploration(
         experiment=experiment,
         job=job,
         study_factory=vizier_cloud.NewStudy(
-            study_config=get_study_spec(),
-            project=_VIZIER_PROJECT.value,
-            location=_VIZIER_REGION.value,
+            study_config=study_spec,
+            project=_PROJECT.value,
+            location=_REGION.value,
         ),
         num_trials_total=_NUM_TRIALS.value,
         num_parallel_trial_runs=_NUM_PARALLEL.value,
-        metric_name=_VIZIER_METRIC.value,
+        metric_name=_METRIC.value,
         gcs_log_base=f'gs://{_GCS_BUCKET.value}',
-        # Don't pass cluster_id - MaxText uses different path pattern
+        # Uses default MaxText pattern: {gcs_log_base}/job-{slurm_job_id}/tensorboard/job-{slurm_job_id}/
     )
 
-    print(f"\nStarting Vizier study...")
-    print(f"Monitor: squeue --me")
-    print(f"Vizier: https://console.cloud.google.com/vertex-ai/experiments")
+    print('Starting Vizier study...')
+    print(f'Monitor jobs: squeue --me')
+    print(f'Vizier console: https://console.cloud.google.com/vertex-ai/experiments')
 
     exploration.launch(poll_frequency_in_sec=60)
 
-    print(f"\nCompleted! Experiment ID: {experiment.experiment_id}")
+    print(f'\nCompleted! Experiment ID: {experiment.experiment_id}')
 
 
 if __name__ == '__main__':

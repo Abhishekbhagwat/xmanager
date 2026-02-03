@@ -13,6 +13,7 @@
 # limitations under the License.
 """Interface for launching Vizier Explorations using Vertex Vizier."""
 
+import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from xmanager import xm
@@ -31,8 +32,12 @@ def _get_slurm_job_id(work_unit: xm.WorkUnit) -> Optional[str]:
   Returns:
     The Slurm job ID as a string, or None if not found.
   """
-  # Access the non-local execution handles
-  handles = getattr(work_unit, '_non_local_execution_handles', [])
+  # Use public method if available, fallback to private attribute for compatibility
+  if hasattr(work_unit, 'get_execution_handles'):
+    handles = work_unit.get_execution_handles()
+  else:
+    handles = getattr(work_unit, '_non_local_execution_handles', [])
+
   for handle in handles:
     if hasattr(handle, 'slurm_job_id'):
       return handle.slurm_job_id
@@ -90,7 +95,7 @@ class VizierExploration:
     async def work_unit_generator(
         work_unit: xm.WorkUnit, vizier_params: Dict[str, Any]
     ):
-      work_unit.add(job, self._to_job_params(vizier_params))
+      await work_unit.add(job, self._to_job_params(vizier_params))
 
     if not study_factory.display_name:
       study_factory.display_name = f'X{experiment.experiment_id}'
@@ -130,9 +135,10 @@ class VizierExploration:
       # Get Slurm job ID from work unit handles
       slurm_job_id = _get_slurm_job_id(work_unit)
       if not slurm_job_id:
-        print(
-            f'Warning: Could not find Slurm job ID for work unit '
-            f'{work_unit.work_unit_id}. Cannot fetch metrics from GCS.'
+        logging.warning(
+            'Could not find Slurm job ID for work unit %s. '
+            'Cannot fetch metrics from GCS.',
+            work_unit.work_unit_id,
         )
         return None
 
@@ -152,7 +158,7 @@ class VizierExploration:
             f'tensorboard/job-{slurm_job_id}/'
         )
 
-      print(f'Fetching metrics from: {gcs_path}')
+      logging.info('Fetching metrics from: %s', gcs_path)
 
       reader = gcs_metric_reader.GCSMetricReader(
           gcs_path=gcs_path,
@@ -161,12 +167,6 @@ class VizierExploration:
 
       # Get all metrics (for full measurement history)
       metrics = reader.get_all_metrics()
-      if not metrics:
-        # Try just getting the latest metric
-        latest = reader.get_latest_metric()
-        if latest:
-          metrics = [latest]
-
       return metrics if metrics else None
 
     return fetch_metrics

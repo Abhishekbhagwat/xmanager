@@ -49,6 +49,10 @@ class LocalWorkUnitStatus(xm.ExperimentUnitStatus):
     return self._status == LocalWorkUnitStatusEnum.RUNNING
 
   @property
+  def is_pending(self) -> bool:
+    return self._status == LocalWorkUnitStatusEnum.PENDING
+
+  @property
   def is_completed(self) -> bool:
     return self._status == LocalWorkUnitStatusEnum.COMPLETED
 

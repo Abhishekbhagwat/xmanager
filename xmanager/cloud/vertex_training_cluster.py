@@ -29,6 +29,7 @@ Supported cluster types:
 """
 
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -37,7 +38,6 @@ from typing import Any, Dict, List, Optional
 
 import attr
 from xmanager import xm
-from xmanager.cloud import auth
 from xmanager.cloud import vertex
 from xmanager.xm import utils
 from xmanager.xm_local import executors as local_executors
@@ -45,6 +45,22 @@ from xmanager.xm_local import handles
 from xmanager.xm_local import registry
 from xmanager.xm_local import status as local_status
 from xmanager.xm_local.storage import database
+
+# Mapping from Slurm states to XManager status
+_SLURM_STATE_TO_STATUS = {
+    'PENDING': local_status.LocalWorkUnitStatusEnum.PENDING,
+    'CONFIGURING': local_status.LocalWorkUnitStatusEnum.PENDING,
+    'RUNNING': local_status.LocalWorkUnitStatusEnum.RUNNING,
+    'COMPLETING': local_status.LocalWorkUnitStatusEnum.RUNNING,
+    'COMPLETED': local_status.LocalWorkUnitStatusEnum.COMPLETED,
+    'FAILED': local_status.LocalWorkUnitStatusEnum.FAILED,
+    'TIMEOUT': local_status.LocalWorkUnitStatusEnum.FAILED,
+    'OUT_OF_MEMORY': local_status.LocalWorkUnitStatusEnum.FAILED,
+    'NODE_FAIL': local_status.LocalWorkUnitStatusEnum.FAILED,
+    'CANCELLED': local_status.LocalWorkUnitStatusEnum.CANCELLED,
+    'PREEMPTED': local_status.LocalWorkUnitStatusEnum.CANCELLED,
+    'SUSPENDED': local_status.LocalWorkUnitStatusEnum.CANCELLED,
+}
 
 
 # =============================================================================
@@ -335,7 +351,7 @@ class Client:
     result = self.run_command(f"scancel {job_id}")
     if result.returncode != 0:
       # Log but don't raise - job might already be done
-      print(f"Warning: scancel {job_id} failed: {result.stderr}")
+      logging.warning("scancel %s failed: %s", job_id, result.stderr)
 
   def get_job_log_path(self, job_id: str, work_dir: str) -> str:
     """Get the path to the job's log file.
@@ -373,10 +389,10 @@ class Client:
       local_path = os.path.expanduser(local_path)
 
       if not os.path.exists(local_path):
-        print(f"Warning: Local path {local_path} does not exist, skipping")
+        logging.warning("Local path %s does not exist, skipping", local_path)
         continue
 
-      print(f"Syncing {local_path} to {remote_dir}...")
+      logging.info("Syncing %s to %s...", local_path, remote_dir)
 
       if self.executor.use_gcloud_ssh and self.executor.login_node:
         # Use gcloud compute ssh with cat to transfer files
@@ -420,12 +436,150 @@ class Client:
             f"Failed to sync {local_path} to {remote_dir}: {result.stderr}"
         )
 
-    print(f"Successfully synced {len(local_paths)} path(s) to {remote_dir}")
+    logging.info("Successfully synced %d path(s) to %s", len(local_paths), remote_dir)
 
 
 # =============================================================================
 # Sbatch Script Generation
 # =============================================================================
+
+
+def _build_command_from_job(job: xm.Job) -> str:
+  """Build command string from job executable and args.
+
+  Args:
+    job: XManager job with executable and args
+
+  Returns:
+    Command string to execute
+  """
+  executable_args = getattr(job.executable, 'args', {})
+  args = xm.merge_args(executable_args, job.args).to_list(utils.ARG_ESCAPER)
+  entrypoint = getattr(job.executable, 'entrypoint', None)
+  path = getattr(job.executable, 'path', None)
+
+  if entrypoint:
+    return f"{entrypoint} {' '.join(args)}".strip()
+  elif path:
+    return f"{path} {' '.join(args)}".strip()
+  return ' '.join(args)
+
+
+def _build_container_mounts(
+    executor: local_executors.VertexTrainingCluster,
+    cluster_config: ClusterConfig,
+) -> str:
+  """Build deduplicated container mounts string.
+
+  Args:
+    executor: VertexTrainingCluster executor
+    cluster_config: Cluster configuration
+
+  Returns:
+    Comma-separated mount paths string
+  """
+  container_mounts_list = [cluster_config.nccl_dir] + list(executor.container_mounts)
+  seen = set()
+  unique_mounts = []
+  for m in container_mounts_list:
+    if m and m not in seen:
+      seen.add(m)
+      unique_mounts.append(m)
+  return ','.join(unique_mounts)
+
+
+def _build_sbatch_flags(
+    executor: local_executors.VertexTrainingCluster,
+) -> Dict[str, str]:
+  """Build sbatch flags with TensorBoard integration if configured.
+
+  Args:
+    executor: VertexTrainingCluster executor
+
+  Returns:
+    Dictionary of sbatch flags
+  """
+  sbatch_flags = dict(executor.sbatch_flags)
+
+  if executor.tensorboard:
+    extra_parts = []
+    # Add tensorboard_base_output_dir (GCS bucket path, e.g., bucket-name/path)
+    # VMDS expects bucket/path format, not /gcs/... or gs://...
+    if executor.tensorboard.base_output_directory:
+      gcs_path = executor.tensorboard.base_output_directory
+      # Strip /gcs/ prefix if present (mounted GCS path)
+      if gcs_path.startswith('/gcs/'):
+        gcs_path = gcs_path[5:]
+      # Strip gs:// prefix if present
+      elif gcs_path.startswith('gs://'):
+        gcs_path = gcs_path[5:]
+      extra_parts.append(f'tensorboard_base_output_dir={gcs_path}')
+    # Add tensorboard_url (the Vertex AI TensorBoard instance URL)
+    if executor.tensorboard.name:
+      extra_parts.append(f'tensorboard_url={executor.tensorboard.name}')
+    if extra_parts:
+      sbatch_flags['extra'] = ','.join(extra_parts)
+
+  return sbatch_flags
+
+
+def _prepare_template_vars(
+    executor: local_executors.VertexTrainingCluster,
+    job: xm.Job,
+    job_name: str,
+    cluster_config: ClusterConfig,
+) -> Dict[str, Any]:
+  """Prepare template variables for sbatch script generation.
+
+  Args:
+    executor: VertexTrainingCluster executor with configuration
+    job: XManager job with executable and args
+    job_name: Name for the job
+    cluster_config: Cluster-specific configuration
+
+  Returns:
+    Dictionary of template variables
+  """
+  num_nodes = executor.requirements.replicas or 1
+  command = _build_command_from_job(job)
+  container_mounts_str = _build_container_mounts(executor, cluster_config)
+  sbatch_flags = _build_sbatch_flags(executor)
+
+  template_vars = {
+      'job_name': job_name,
+      'num_nodes': num_nodes,
+      'gpus_per_node': cluster_config.gpus_per_node,
+      'partition': executor.partition,
+      'account': executor.account,
+      'time_limit': executor.time_limit,
+      'exclusive': executor.exclusive,
+      'command': command,
+      'working_dir': executor.work_dir,
+      'env_vars': executor.env_vars,
+      'sbatch_flags': sbatch_flags,
+      'prologue_commands': executor.prologue_commands,
+      'epilogue_commands': executor.epilogue_commands,
+      # NCCL configuration
+      'nccl_setup_script': cluster_config.setup_script,
+      'nccl_lib_path': cluster_config.get_nccl_lib_path(),
+      'nccl_env_vars': cluster_config.nccl_env_vars,
+      # Container configuration
+      'container_image': executor.container_image,
+      'container_mounts': container_mounts_str,
+      'use_mpi': executor.use_mpi,
+      'container_env_passthrough': executor.container_env_passthrough,
+      # Distributed training
+      'master_port': executor.master_port,
+      'setup_jax_coordinator': executor.setup_jax_coordinator,
+  }
+
+  # Add output/error file paths if log_dir is set
+  if executor.log_dir:
+    template_vars['output_file'] = f"{executor.log_dir}/slurm-%j.out"
+    template_vars['error_file'] = f"{executor.log_dir}/slurm-%j.err"
+
+  return template_vars
+
 
 def _generate_sbatch_script(
     executor: local_executors.VertexTrainingCluster,
@@ -453,183 +607,28 @@ def _generate_sbatch_script(
     ValueError: If invalid configuration or missing required fields
   """
   # Mode 1: Raw sbatch script
-  if hasattr(executor, 'sbatch_script') and executor.sbatch_script:
+  if executor.sbatch_script:
     return executor.sbatch_script
 
-  # Mode 2: Jinja2 template
-  if hasattr(executor, 'sbatch_template') and executor.sbatch_template:
-    try:
-      from xmanager.cloud import sbatch_templates
-    except ImportError:
-      raise ImportError(
-          "sbatch_template mode requires xmanager.cloud.sbatch_templates module"
-      )
-
-    # Prepare template variables
-    num_nodes = getattr(executor.requirements, 'replicas', 1)
-    gpus_per_node = cluster_config.gpus_per_node
-
-    # Build command from job executable
-    executable_args = getattr(job.executable, 'args', {})
-    args = xm.merge_args(executable_args, job.args).to_list(utils.ARG_ESCAPER)
-    entrypoint = getattr(job.executable, 'entrypoint', None)
-    if entrypoint:
-      command = f"{entrypoint} {' '.join(args)}".strip()
-    else:
-      command = ' '.join(args)
-
-    # Build container mounts string (deduplicate to avoid redundant mounts)
-    container_mounts_list = [cluster_config.nccl_dir] + list(getattr(executor, 'container_mounts', []))
-    # Deduplicate while preserving order
-    seen = set()
-    unique_mounts = []
-    for m in container_mounts_list:
-      if m and m not in seen:
-        seen.add(m)
-        unique_mounts.append(m)
-    container_mounts_str = ','.join(unique_mounts)
-
-    # Build sbatch_flags with TensorBoard integration if configured
-    sbatch_flags = dict(getattr(executor, 'sbatch_flags', {}))
-    if hasattr(executor, 'tensorboard') and executor.tensorboard:
-      extra_parts = []
-      # Add tensorboard_base_output_dir (GCS bucket path, e.g., bucket-name/path)
-      # VMDS expects bucket/path format, not /gcs/... or gs://...
-      if executor.tensorboard.base_output_directory:
-        gcs_path = executor.tensorboard.base_output_directory
-        # Strip /gcs/ prefix if present (mounted GCS path)
-        if gcs_path.startswith('/gcs/'):
-          gcs_path = gcs_path[5:]
-        # Strip gs:// prefix if present
-        elif gcs_path.startswith('gs://'):
-          gcs_path = gcs_path[5:]
-        extra_parts.append(f'tensorboard_base_output_dir={gcs_path}')
-      # Add tensorboard_url (the Vertex AI TensorBoard instance URL)
-      if executor.tensorboard.name:
-        extra_parts.append(f'tensorboard_url={executor.tensorboard.name}')
-      if extra_parts:
-        sbatch_flags['extra'] = ','.join(extra_parts)
-
-    template_vars = {
-        'job_name': job_name,
-        'num_nodes': num_nodes,
-        'gpus_per_node': gpus_per_node,
-        'partition': getattr(executor, 'partition', None),
-        'account': getattr(executor, 'account', None),
-        'time_limit': getattr(executor, 'time_limit', None),
-        'exclusive': getattr(executor, 'exclusive', True),
-        'command': command,
-        'working_dir': executor.work_dir,
-        'env_vars': getattr(executor, 'env_vars', {}),
-        'sbatch_flags': sbatch_flags,
-        'prologue_commands': getattr(executor, 'prologue_commands', []),
-        'epilogue_commands': getattr(executor, 'epilogue_commands', []),
-        # NCCL configuration
-        'nccl_setup_script': cluster_config.setup_script,
-        'nccl_lib_path': cluster_config.get_nccl_lib_path(),
-        'nccl_env_vars': cluster_config.nccl_env_vars,
-        # Container configuration
-        'container_image': getattr(executor, 'container_image', None),
-        'container_mounts': container_mounts_str,
-        'use_mpi': getattr(executor, 'use_mpi', False),
-        'container_env_passthrough': getattr(executor, 'container_env_passthrough', []),
-        # Distributed training
-        'master_port': getattr(executor, 'master_port', 29500),
-        'setup_jax_coordinator': getattr(executor, 'setup_jax_coordinator', False),
-    }
-
-    # Add output/error file paths if log_dir is set
-    log_dir = getattr(executor, 'log_dir', None)
-    if log_dir:
-        template_vars['output_file'] = f"{log_dir}/slurm-%j.out"
-        template_vars['error_file'] = f"{log_dir}/slurm-%j.err"
-
-    renderer = sbatch_templates.SbatchTemplateRenderer()
-    return renderer.render(**template_vars)
-
-  # No valid mode specified - use default template with job executable
-  # This is the common case: user provides container_image and command via job args
+  # Import sbatch_templates (needed for both template and default modes)
   try:
     from xmanager.cloud import sbatch_templates
   except ImportError:
     raise ImportError(
-        "Default template mode requires xmanager.cloud.sbatch_templates module"
+        "sbatch script generation requires xmanager.cloud.sbatch_templates module"
     )
 
-  num_nodes = getattr(executor.requirements, 'replicas', 1) or 1
-  gpus_per_node = cluster_config.gpus_per_node
+  # Prepare template variables (common for both modes)
+  template_vars = _prepare_template_vars(executor, job, job_name, cluster_config)
 
-  # Build command from job executable
-  executable_args = getattr(job.executable, 'args', {})
-  args = xm.merge_args(executable_args, job.args).to_list(utils.ARG_ESCAPER)
-  entrypoint = getattr(job.executable, 'entrypoint', None)
-  path = getattr(job.executable, 'path', None)
-  if entrypoint:
-    command = f"{entrypoint} {' '.join(args)}".strip()
-  elif path:
-    command = f"{path} {' '.join(args)}".strip()
-  else:
-    command = ' '.join(args)
+  # Mode 2: Custom Jinja2 template
+  if executor.sbatch_template:
+    renderer = sbatch_templates.SbatchTemplateRenderer()
+    return renderer.render(**template_vars)
 
-  # Build container mounts string (deduplicate to avoid redundant mounts)
-  container_mounts_list = [cluster_config.nccl_dir] + list(getattr(executor, 'container_mounts', []))
-  # Deduplicate while preserving order
-  seen = set()
-  unique_mounts = []
-  for m in container_mounts_list:
-    if m and m not in seen:
-      seen.add(m)
-      unique_mounts.append(m)
-  container_mounts_str = ','.join(unique_mounts)
-
-  # Build sbatch_flags with TensorBoard integration if configured
-  sbatch_flags = dict(getattr(executor, 'sbatch_flags', {}))
-  if hasattr(executor, 'tensorboard') and executor.tensorboard:
-    extra_parts = []
-    # Add tensorboard_base_output_dir (GCS bucket path, e.g., bucket-name/path)
-    # VMDS expects bucket/path format, not /gcs/... or gs://...
-    if executor.tensorboard.base_output_directory:
-      gcs_path = executor.tensorboard.base_output_directory
-      # Strip /gcs/ prefix if present (mounted GCS path)
-      if gcs_path.startswith('/gcs/'):
-        gcs_path = gcs_path[5:]
-      # Strip gs:// prefix if present
-      elif gcs_path.startswith('gs://'):
-        gcs_path = gcs_path[5:]
-      extra_parts.append(f'tensorboard_base_output_dir={gcs_path}')
-    # Add tensorboard_url (the Vertex AI TensorBoard instance URL)
-    if executor.tensorboard.name:
-      extra_parts.append(f'tensorboard_url={executor.tensorboard.name}')
-    if extra_parts:
-      sbatch_flags['extra'] = ','.join(extra_parts)
-
+  # Mode 3: Default template
   renderer = sbatch_templates.SbatchTemplateRenderer()
-  return renderer.render(
-      job_name=job_name,
-      num_nodes=num_nodes,
-      gpus_per_node=gpus_per_node,
-      partition=getattr(executor, 'partition', None),
-      account=getattr(executor, 'account', None),
-      time_limit=getattr(executor, 'time_limit', None),
-      exclusive=getattr(executor, 'exclusive', True),
-      command=command,
-      working_dir=executor.work_dir,
-      env_vars=getattr(executor, 'env_vars', {}),
-      sbatch_flags=sbatch_flags,
-      prologue_commands=getattr(executor, 'prologue_commands', []),
-      epilogue_commands=getattr(executor, 'epilogue_commands', []),
-      nccl_setup_script=cluster_config.setup_script,
-      nccl_lib_path=cluster_config.get_nccl_lib_path(),
-      nccl_env_vars=cluster_config.nccl_env_vars,
-      # Container configuration
-      container_image=getattr(executor, 'container_image', None),
-      container_mounts=container_mounts_str,
-      use_mpi=getattr(executor, 'use_mpi', False),
-      container_env_passthrough=getattr(executor, 'container_env_passthrough', []),
-      # Distributed training
-      master_port=getattr(executor, 'master_port', 29500),
-      setup_jax_coordinator=getattr(executor, 'setup_jax_coordinator', False),
-  )
+  return renderer.render(**template_vars)
 
 
 # =============================================================================
@@ -673,38 +672,12 @@ class VertexTrainingClusterHandle(handles.ExecutionHandle):
       LocalWorkUnitStatus with current state
     """
     slurm_status = self.client.get_job_status(self.slurm_job_id)
-
-    # Map Slurm states to XManager states
-    if slurm_status == 'PENDING':
-      return local_status.LocalWorkUnitStatus(
-          local_status.LocalWorkUnitStatusEnum.PENDING,
-          message=f"Slurm job {self.slurm_job_id} pending"
-      )
-    elif slurm_status == 'RUNNING':
-      return local_status.LocalWorkUnitStatus(
-          local_status.LocalWorkUnitStatusEnum.RUNNING,
-          message=f"Slurm job {self.slurm_job_id} running"
-      )
-    elif slurm_status == 'COMPLETED':
-      return local_status.LocalWorkUnitStatus(
-          local_status.LocalWorkUnitStatusEnum.COMPLETED,
-          message=f"Slurm job {self.slurm_job_id} completed successfully"
-      )
-    elif slurm_status == 'FAILED':
-      return local_status.LocalWorkUnitStatus(
-          local_status.LocalWorkUnitStatusEnum.FAILED,
-          message=f"Slurm job {self.slurm_job_id} failed"
-      )
-    elif slurm_status == 'CANCELLED':
-      return local_status.LocalWorkUnitStatus(
-          local_status.LocalWorkUnitStatusEnum.CANCELLED,
-          message=f"Slurm job {self.slurm_job_id} cancelled"
-      )
-    else:
-      return local_status.LocalWorkUnitStatus(
-          local_status.LocalWorkUnitStatusEnum.UNKNOWN,
-          message=f"Slurm job {self.slurm_job_id} status: {slurm_status}"
-      )
+    status = _SLURM_STATE_TO_STATUS.get(
+        slurm_status, local_status.LocalWorkUnitStatusEnum.UNKNOWN
+    )
+    return local_status.LocalWorkUnitStatus(
+        status, message=f"Slurm job {self.slurm_job_id}: {slurm_status}"
+    )
 
   def save_to_storage(self, experiment_id: int, work_unit_id: int) -> None:
     """Save job info to database.
@@ -750,7 +723,7 @@ class VertexTrainingClusterHandle(handles.ExecutionHandle):
         line = await process.stdout.readline()
         if not line:
           break
-        print(f"[{self.job_name}] {line.decode().strip()}")
+        logging.info("[%s] %s", self.job_name, line.decode().strip())
 
         # Check if job has completed
         status = self.client.get_job_status(self.slurm_job_id)
@@ -760,27 +733,62 @@ class VertexTrainingClusterHandle(handles.ExecutionHandle):
           if remaining:
             for line in remaining.decode().split('\n'):
               if line.strip():
-                print(f"[{self.job_name}] {line.strip()}")
+                logging.info("[%s] %s", self.job_name, line.strip())
           break
 
     except asyncio.CancelledError:
       # Monitor was cancelled
       pass
     except Exception as e:
-      print(f"Warning: Error monitoring job {self.job_name}: {e}")
+      logging.warning("Error monitoring job %s: %s", self.job_name, e)
 
 
 # =============================================================================
 # Launch Logic
 # =============================================================================
 
+
 def _vertex_training_cluster_job_predicate(job: xm.Job) -> bool:
   """Filter for Vertex Training Cluster jobs."""
   return isinstance(job.executor, local_executors.VertexTrainingCluster)
 
 
-async def launch(
-    local_experiment_unit: Any, job_group: xm.JobGroup
+async def _resolve_tensorboard(
+    executor: local_executors.VertexTrainingCluster,
+) -> None:
+  """Resolve TensorBoard instance if configured with display name.
+
+  Updates executor.tensorboard.name to full resource URL if needed.
+
+  Args:
+    executor: VertexTrainingCluster executor with tensorboard config
+  """
+  if not executor.tensorboard:
+    return
+
+  tb_name = executor.tensorboard.name
+  # If name doesn't look like a full resource URL, resolve it
+  if tb_name and not tb_name.startswith('projects/'):
+    try:
+      vertex_client = vertex.Client(
+          project=executor.tensorboard_project,
+          location=executor.tensorboard_region,
+      )
+      full_tb_name = await vertex_client.get_or_create_tensorboard(tb_name)
+      # Update the tensorboard name to full resource URL
+      executor.tensorboard = local_executors.TensorboardCapability(
+          name=full_tb_name,
+          base_output_directory=executor.tensorboard.base_output_directory,
+      )
+      logging.info("Using TensorBoard: %s", full_tb_name)
+    except Exception as e:
+      logging.warning("Failed to resolve TensorBoard '%s': %s", tb_name, e)
+
+
+def launch(
+    experiment_id: int,
+    experiment_unit_name: str,
+    job_group: xm.JobGroup,
 ) -> List[VertexTrainingClusterHandle]:
   """Launch jobs on Vertex Training Cluster via Slurm.
 
@@ -788,10 +796,10 @@ async def launch(
     1. Generates sbatch scripts from executor configuration
     2. Submits jobs to Slurm via sbatch
     3. Creates handles to track job status
-    4. Optionally streams job output
 
   Args:
-    local_experiment_unit: Experiment unit with metadata
+    experiment_id: ID of the experiment
+    experiment_unit_name: Name of the experiment unit
     job_group: Job group containing jobs to launch
 
   Returns:
@@ -805,9 +813,6 @@ async def launch(
     return []
 
   handles_list = []
-  experiment_id = local_experiment_unit.experiment_id
-  work_unit_id = local_experiment_unit.work_unit_id
-  experiment_unit_name = local_experiment_unit.experiment_unit_name or f"wu_{work_unit_id}"
 
   for job in jobs:
     executor = job.executor
@@ -821,33 +826,13 @@ async def launch(
     work_dir = executor.work_dir or os.getcwd()
 
     # Rsync local files to cluster if specified
-    local_files = getattr(executor, 'local_files', [])
-    if local_files:
+    if executor.local_files:
       try:
-        client.rsync_files(local_files, work_dir)
+        client.rsync_files(executor.local_files, work_dir)
       except Exception as e:
         raise RuntimeError(
             f"Failed to sync local files for job {job_name}: {e}"
         )
-
-    # Resolve TensorBoard instance if configured with display name
-    if hasattr(executor, 'tensorboard') and executor.tensorboard:
-      tb_name = executor.tensorboard.name
-      # If name doesn't look like a full resource URL, resolve it
-      if tb_name and not tb_name.startswith('projects/'):
-        try:
-          region = getattr(executor, 'tensorboard_region', 'us-central1')
-          project = getattr(executor, 'tensorboard_project', None)
-          vertex_client = vertex.Client(project=project, location=region)
-          full_tb_name = await vertex_client.get_or_create_tensorboard(tb_name)
-          # Update the tensorboard name to full resource URL
-          executor.tensorboard = local_executors.TensorboardCapability(
-              name=full_tb_name,
-              base_output_directory=executor.tensorboard.base_output_directory,
-          )
-          print(f"Using TensorBoard: {full_tb_name}")
-        except Exception as e:
-          print(f"Warning: Failed to resolve TensorBoard '{tb_name}': {e}")
 
     # Generate sbatch script
     try:
@@ -862,7 +847,7 @@ async def launch(
     # Submit to Slurm
     try:
       slurm_job_id = client.submit_sbatch(script_content, work_dir)
-      print(f"Submitted Slurm job {slurm_job_id} for {job_name}")
+      logging.info("Submitted Slurm job %s for %s", slurm_job_id, job_name)
     except Exception as e:
       raise RuntimeError(
           f"Failed to submit Slurm job for {job_name}: {e}"
@@ -876,30 +861,59 @@ async def launch(
         executor=executor,
     )
 
-    # Note: save_to_storage is called by experiment.py's _save_handles_to_storage
-
-    # Start monitoring if enabled
-    if executor.stream_output:
-      monitor_task = asyncio.create_task(handle.monitor())
-      handle._monitor_task = monitor_task
-
     handles_list.append(handle)
 
   return handles_list
 
 
-def _create_handle(*args, data, vertex_training_cluster_jobs) -> VertexTrainingClusterHandle:
-  """Restore handle from database.
+async def _async_launch(
+    local_experiment_unit: Any, job_group: xm.JobGroup
+) -> List[VertexTrainingClusterHandle]:
+  """Async wrapper for launch that handles TensorBoard resolution and monitoring.
+
+  Args:
+    local_experiment_unit: Experiment unit with metadata
+    job_group: Job group containing jobs to launch
+
+  Returns:
+    List of execution handles for submitted jobs
+  """
+  # Resolve TensorBoard for all VTC executors before launch
+  jobs = xm.job_operators.collect_jobs_by_filter(
+      job_group, _vertex_training_cluster_job_predicate
+  )
+  for job in jobs:
+    await _resolve_tensorboard(job.executor)
+
+  experiment_unit_name = (
+      local_experiment_unit.experiment_unit_name
+      or f"wu_{local_experiment_unit.work_unit_id}"
+  )
+
+  handles_list = launch(
+      local_experiment_unit.experiment_id,
+      experiment_unit_name,
+      job_group,
+  )
+
+  # Start monitoring for handles that have stream_output enabled
+  for handle in handles_list:
+    if handle.executor.stream_output:
+      monitor_task = asyncio.create_task(handle.monitor())
+      handle._monitor_task = monitor_task
+
+  return handles_list
+
+
+def _create_vtc_handle(data) -> VertexTrainingClusterHandle:
+  """Create a VTC handle from database record.
 
   Args:
     data: Database record with job information
-    vertex_training_cluster_jobs: List to append restored handle
 
   Returns:
     Restored execution handle
   """
-  del args
-
   executor = local_executors.VertexTrainingCluster(
       cluster_type=data.vertex_training_cluster.cluster_type,
       login_node=data.vertex_training_cluster.login_node or None,
@@ -910,23 +924,20 @@ def _create_handle(*args, data, vertex_training_cluster_jobs) -> VertexTrainingC
   )
 
   slurm_job_id = data.vertex_training_cluster.slurm_job_id or ""
-  job_name = f"vtc_job_{slurm_job_id}" if slurm_job_id else "restored_job"
+  job_name = data.vertex_training_cluster.job_name or f"vtc_job_{slurm_job_id}"
 
-  handle = VertexTrainingClusterHandle(
+  return VertexTrainingClusterHandle(
       job_name=job_name,
       slurm_job_id=slurm_job_id,
       client=Client(executor),
       executor=executor,
   )
 
-  vertex_training_cluster_jobs.append(handle)
-  return handle
-
 
 def register():
   """Registers Vertex Training Cluster execution logic with XManager."""
   registry.register(
       local_executors.VertexTrainingCluster,
-      launch=launch,
-      create_handle=_create_handle,
+      launch=_async_launch,
+      create_handle=lambda *args, data, **kwargs: _create_vtc_handle(data),
   )
