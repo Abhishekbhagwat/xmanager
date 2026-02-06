@@ -26,7 +26,11 @@ _TRIAL_NAME_REGEX = (
 class VizierWorker:
   """Worker that manage interaction between job and Vizier."""
 
-  def __init__(self, trial_name: str) -> None:
+  def __init__(
+      self,
+      trial_name: str,
+      vz_client: Optional[aip.VizierServiceClient] = None,
+  ) -> None:
     if not re.match(_TRIAL_NAME_REGEX, trial_name):
       raise Exception(
           'The trial_name must be in the form: '
@@ -36,12 +40,15 @@ class VizierWorker:
 
     self._trial_name = trial_name
 
-    location = trial_name.split('/')[3]
-    self._vz_client = aip.VizierServiceClient(
-        client_options={
-            'api_endpoint': f'{location}-aiplatform.googleapis.com',
-        }
-    )
+    if vz_client:
+      self._vz_client = vz_client
+    else:
+      location = trial_name.split('/')[3]
+      self._vz_client = aip.VizierServiceClient(
+          client_options={
+              'api_endpoint': f'{location}-aiplatform.googleapis.com',
+          }
+      )
 
   def add_trial_measurement(self, step: int, metrics: Dict[str, float]) -> None:
     """Add trial measurements to Vizier."""

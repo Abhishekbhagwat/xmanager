@@ -15,8 +15,7 @@
 
 import asyncio
 import logging
-import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from google.cloud import aiplatform_v1beta1 as aip
 
@@ -24,8 +23,11 @@ from xmanager import xm
 from xmanager.vizier.vizier_cloud import vizier_worker
 
 # Type alias for metric fetcher callback
-# Takes a work unit and returns Optional[(step, value)] or list of (step, value)
-MetricFetcherType = Callable[[xm.WorkUnit], Optional[List[Tuple[int, float]]]]
+# Takes a work unit and returns list of (step, metrics_dict) tuples
+# where metrics_dict maps metric names to their values
+MetricFetcherType = Callable[
+    [xm.WorkUnit], Optional[List[Tuple[int, Dict[str, float]]]]
+]
 
 
 class VizierController:
@@ -40,7 +42,7 @@ class VizierController:
       num_work_units_total: int,
       num_parallel_work_units: int,
       metric_fetcher: Optional[MetricFetcherType] = None,
-      metric_id: Optional[str] = None,
+      metric_ids: Optional[Union[str, List[str]]] = None,
   ) -> None:
     """Create a VizierController.
 
@@ -56,9 +58,11 @@ class VizierController:
       num_parallel_work_units: number of work units to run in parallel.
       metric_fetcher: Optional callback to fetch metrics from external sources
         (e.g., GCS TensorBoard logs). Takes a WorkUnit and returns a list of
-        (step, value) tuples, or None if no metrics available.
-      metric_id: The metric ID to use when reporting measurements to Vizier.
-        Required if metric_fetcher is provided.
+        (step, metrics_dict) tuples, or None if no metrics available.
+      metric_ids: The metric ID(s) to use when reporting measurements to Vizier.
+        Can be a single string for backward compatibility or a list of metric
+        IDs for multi-objective optimization. Required if metric_fetcher is
+        provided.
     """
     self._experiment = experiment
     self._work_unit_generator = work_unit_generator
@@ -67,7 +71,13 @@ class VizierController:
     self._num_work_units_total = num_work_units_total
     self._num_parallel_work_units = num_parallel_work_units
     self._metric_fetcher = metric_fetcher
-    self._metric_id = metric_id
+    # Normalize to list for internal handling
+    if metric_ids is None:
+      self._metric_ids = None
+    elif isinstance(metric_ids, str):
+      self._metric_ids = [metric_ids]
+    else:
+      self._metric_ids = list(metric_ids)
 
     self._work_unit_updaters: List[WorkUnitVizierUpdater] = []
 
@@ -89,7 +99,7 @@ class VizierController:
       # 1. Complete trial for completed work unit; Early stop first if needed.
       for work_unit_updater in self._work_unit_updaters:
         if not work_unit_updater.completed:
-          work_unit_updater.check_for_completion()
+          await work_unit_updater.check_for_completion()
 
       # 2. Check if all work units are done
       num_existing_work_units = len(self._work_unit_updaters)
@@ -160,7 +170,7 @@ class VizierController:
               work_unit=work_unit,
               trial=trial,
               metric_fetcher=self._metric_fetcher,
-              metric_id=self._metric_id,
+              metric_ids=self._metric_ids,
           )
       )
 
@@ -198,17 +208,19 @@ class WorkUnitVizierUpdater:
       work_unit: xm.WorkUnit,
       trial: aip.Trial,
       metric_fetcher: Optional[MetricFetcherType] = None,
-      metric_id: Optional[str] = None,
+      metric_ids: Optional[List[str]] = None,
   ) -> None:
     self.completed = False
     self._vz_client = vz_client  # Still needed for early stopping check
     self._work_unit = work_unit
     self._trial = trial
     self._metric_fetcher = metric_fetcher
-    self._metric_id = metric_id
+    self._metric_ids = metric_ids
 
     # Use VizierWorker for metric reporting and trial completion
-    self._worker = vizier_worker.VizierWorker(trial.name)
+    self._worker = vizier_worker.VizierWorker(
+        trial.name, vz_client=vz_client
+    )
 
   def work_unit_status(self) -> xm.ExperimentUnitStatus:
     return self._work_unit.get_status()
@@ -228,7 +240,7 @@ class WorkUnitVizierUpdater:
     # Fallback: if not active and not completed/failed, assume pending
     return not status.is_active
 
-  def check_for_completion(self) -> None:
+  async def check_for_completion(self) -> None:
     """Sync the completion status between WorkUnit and Vizier Trial if needed."""
     if self.completed:
       return
@@ -240,8 +252,8 @@ class WorkUnitVizierUpdater:
       logging.info('Work unit %s is running.', self._work_unit.work_unit_id)
 
       # Fetch intermediate metrics for early stopping / progress
-      if self._metric_fetcher and self._metric_id:
-        self._fetch_and_report_metrics()
+      if self._metric_fetcher and self._metric_ids:
+        await self._fetch_and_report_metrics()
 
       # Check for early stopping from Vizier
       if (
@@ -271,8 +283,8 @@ class WorkUnitVizierUpdater:
 
     # Fetch final metrics with retry
     metrics_reported = False
-    if self._metric_fetcher and self._metric_id:
-      metrics_reported = self._fetch_metrics_with_retry()
+    if self._metric_fetcher and self._metric_ids:
+      metrics_reported = await self._fetch_metrics_with_retry()
 
     # Complete the trial
     if metrics_reported:
@@ -283,7 +295,7 @@ class WorkUnitVizierUpdater:
       )
     self.completed = True
 
-  def _fetch_and_report_metrics(self) -> bool:
+  async def _fetch_and_report_metrics(self) -> bool:
     """Fetch metrics from external source and report to Vizier.
 
     Returns:
@@ -297,8 +309,8 @@ class WorkUnitVizierUpdater:
         )
         return False
 
-      for step, value in metrics:
-        self._report_measurement(step, value)
+      for step, metrics_dict in metrics:
+        self._report_measurement(step, metrics_dict)
 
       logging.info(
           'Reported %d measurement(s) for work unit %s.',
@@ -314,7 +326,7 @@ class WorkUnitVizierUpdater:
       )
       return False
 
-  def _fetch_metrics_with_retry(
+  async def _fetch_metrics_with_retry(
       self, max_retries: int = 3, delay: float = 30.0
   ) -> bool:
     """Fetch metrics with retry for GCS sync delays.
@@ -327,7 +339,7 @@ class WorkUnitVizierUpdater:
         True if at least one metric was reported.
     """
     for attempt in range(max_retries):
-      if self._fetch_and_report_metrics():
+      if await self._fetch_and_report_metrics():
         return True
       if attempt < max_retries - 1:
         logging.info(
@@ -336,17 +348,17 @@ class WorkUnitVizierUpdater:
             attempt + 2,
             max_retries,
         )
-        time.sleep(delay)
+        await asyncio.sleep(delay)
     return False
 
-  def _report_measurement(self, step: int, value: float) -> None:
+  def _report_measurement(self, step: int, metrics: Dict[str, float]) -> None:
     """Report a single measurement to Vizier.
 
     Args:
       step: The training step for this measurement.
-      value: The metric value at this step.
+      metrics: Dictionary mapping metric names to their values at this step.
     """
-    self._worker.add_trial_measurement(step, {self._metric_id: value})
+    self._worker.add_trial_measurement(step, metrics)
 
   def _complete_trial(
       self, trial: aip.Trial, infeasible_reason: Optional[str] = None

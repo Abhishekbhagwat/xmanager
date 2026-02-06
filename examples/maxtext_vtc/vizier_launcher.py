@@ -1,40 +1,46 @@
-# Copyright 2021 DeepMind Technologies Limited
+# Copyright 2024 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#      https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+r"""Vizier hyperparameter tuning with MaxText on Vertex Training Cluster.
 
-r"""Simplified XManager launcher for MaxText + Vizier on VTC.
+Demonstrates Vizier-driven HPO with MaxText on VTC:
+  - Vizier study creation with search space and objectives
+  - Multi-objective optimization (minimize loss + maximize throughput)
+  - Automatic metric collection from GCS TensorBoard logs
+  - Parallel trial execution across work units
+  - Parameter injection into MaxText CLI args
 
-Tests VTC + Vizier integration with minimal configuration.
+How it works:
+  1. Creates a Vizier study with hyperparameter search space
+  2. Requests trial suggestions from Vizier
+  3. Launches work units with suggested parameters as MaxText args
+  4. Monitors GCS for TensorBoard metrics
+  5. Reports metrics back to Vizier
+  6. Repeats until all trials complete
 
 Usage:
-  xmanager launch examples/maxtext_vtc/launcher.py -- \
+  xmanager launch examples/maxtext_vtc/vizier_launcher.py -- \
     --login_node=vmdsa3u04-login-001 \
+    --gcs_bucket=ai-infra-gcs-europe-west4 \
     --use_gcloud_ssh \
     --ssh_hostname=nic0.vmdsa3u04-login-001.europe-west4-a.c.ai-infra-recipe-validation.internal.gcpnode.com \
-    --gcs_bucket=ai-infra-gcs-europe-west4 \
     --tensorboard=ai-infra-europe-west4-tb \
     --tensorboard_region=europe-west4 \
     --tensorboard_project=ai-infra-recipe-validation \
     --tensorboard_gcs_path=ai-infra-gcs-europe-west4 \
-    --cluster_type=hcc-a3u \
-    --partition=a3u \
-    --nodes=4 \
     --num_trials=10 \
+    --num_parallel=2 \
     --steps=100
-
-TensorBoard logs are written to $AIP_TENSORBOARD_LOG_DIR (set by VMDS when
-TensorBoard is configured). Vizier discovers the path automatically via GCS
-blob listing.
 """
 
 import time
@@ -47,6 +53,7 @@ from xmanager import xm
 from xmanager import xm_local
 from xmanager.vizier import vizier_cloud
 
+# Required
 _LOGIN_NODE = flags.DEFINE_string('login_node', None, 'SSH login node (required)')
 _GCS_BUCKET = flags.DEFINE_string('gcs_bucket', None, 'GCS bucket name (required)')
 
@@ -54,8 +61,10 @@ _GCS_BUCKET = flags.DEFINE_string('gcs_bucket', None, 'GCS bucket name (required
 _CLUSTER_TYPE = flags.DEFINE_string('cluster_type', 'hcc-a3u', 'Cluster type')
 _PARTITION = flags.DEFINE_string('partition', 'a3u', 'Slurm partition')
 _NODES = flags.DEFINE_integer('nodes', 2, 'Number of nodes')
+_ACCOUNT = flags.DEFINE_string('account', None, 'Slurm account (optional)')
+_TIME_LIMIT = flags.DEFINE_string('time_limit', None, 'Time limit (e.g., "1:00:00")')
 
-# Paths (with defaults)
+# Paths
 _WORK_DIR = flags.DEFINE_string(
     'work_dir', '/home/abhishekbhgwt_google_com/vertexai-mds/nemo', 'Work dir on cluster')
 _CONTAINER_IMAGE = flags.DEFINE_string(
@@ -64,38 +73,29 @@ _CONTAINER_IMAGE = flags.DEFINE_string(
 _CONFIG_FILE = flags.DEFINE_string(
     'config_file', '/mnt/jobs/config.yaml', 'MaxText config file')
 
-# SSH options
+# SSH
 _USE_GCLOUD_SSH = flags.DEFINE_bool('use_gcloud_ssh', True, 'Use gcloud compute ssh')
 _SSH_HOSTNAME = flags.DEFINE_string('ssh_hostname', None, 'SSH hostname override')
 
-# Training/Vizier config
+# Training
 _STEPS = flags.DEFINE_integer('steps', 10, 'Training steps per trial')
+
+# Vizier
 _NUM_TRIALS = flags.DEFINE_integer('num_trials', 2, 'Number of Vizier trials')
 _NUM_PARALLEL = flags.DEFINE_integer('num_parallel', 1, 'Parallel trials')
-_METRIC = flags.DEFINE_string('metric', 'learning/loss', 'Metric to optimize')
-
-# Vizier project/region
+_METRIC = flags.DEFINE_string('metric', 'learning/loss', 'Primary metric to optimize')
 _PROJECT = flags.DEFINE_string('project', 'ai-infra-recipe-validation', 'GCP project')
 _REGION = flags.DEFINE_string('region', 'europe-west4', 'GCP region')
 
+# TensorBoard
+_TENSORBOARD = flags.DEFINE_string('tensorboard', None, 'Vertex AI TensorBoard display name')
+_TENSORBOARD_REGION = flags.DEFINE_string('tensorboard_region', 'us-central1', 'TensorBoard region')
+_TENSORBOARD_PROJECT = flags.DEFINE_string('tensorboard_project', None, 'TensorBoard GCP project')
+_TENSORBOARD_GCS_PATH = flags.DEFINE_string('tensorboard_gcs_path', None, 'TensorBoard GCS bucket')
+
 # Debug
 _DRY_RUN = flags.DEFINE_bool('dry_run', False, 'Validate config without submitting')
-
-# TensorBoard integration (native VTC support via sbatch --extra)
-_TENSORBOARD = flags.DEFINE_string(
-    'tensorboard', None,
-    'Vertex AI TensorBoard display name (e.g., "ai-infra-europe-west4-tb"). '
-    'If set, enables native VTC TensorBoard integration. '
-    'Instance will be looked up or created automatically.')
-_TENSORBOARD_REGION = flags.DEFINE_string(
-    'tensorboard_region', 'us-central1',
-    'Vertex AI region for TensorBoard instance (e.g., "europe-west4").')
-_TENSORBOARD_PROJECT = flags.DEFINE_string(
-    'tensorboard_project', None,
-    'GCP project ID for TensorBoard. If not set, uses default ADC project.')
-_TENSORBOARD_GCS_PATH = flags.DEFINE_string(
-    'tensorboard_gcs_path', None,
-    'GCS bucket path for TensorBoard logs (e.g., "my-bucket").')
+_STREAM_OUTPUT = flags.DEFINE_bool('stream_output', True, 'Stream slurm output via SSH')
 
 
 def main(_):
@@ -109,22 +109,17 @@ def main(_):
 
   timestamp = time.strftime('%Y%m%d-%H%M%S')
 
-  # JAX/XLA environment variables for distributed training
   env_vars = {
-      # NCCL configuration
       'NCCL_SOCKET_IFNAME': 'enp0s19,enp192s20',
       'NCCL_DEBUG': 'VERSION',
       'CUDA_DEVICE_MAX_CONNECTIONS': '1',
-      # JAX configuration
       'JAX_PLATFORMS': 'cuda',
       'JAX_REMOVE_CUSTOM_PARTITIONING_PTR_FROM_CACHE_KEY': 'true',
       'JAX_ENABLE_PGLE': 'false',
-      'SLURM_NTASKS_PER_NODE': '8',  # Required for JAX multiprocess (8 GPUs/node)
-      # XLA/TensorFlow configuration
+      'SLURM_NTASKS_PER_NODE': '8',
       'TF_CPP_MIN_LOG_LEVEL': '0',
       'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.98',
       'NVTE_FUSED_ATTN': '1',
-      # XLA optimization flags
       'XLA_FLAGS': (
           '--xla_gpu_enable_latency_hiding_scheduler=true '
           '--xla_gpu_enable_triton_gemm=false '
@@ -142,7 +137,6 @@ def main(_):
       ),
   }
 
-  # Env vars to pass into container
   container_env_passthrough = [
       'JAX_COORDINATOR_ADDRESS',
       'JAX_PLATFORMS',
@@ -151,7 +145,6 @@ def main(_):
       'SLURM_NTASKS_PER_NODE',
   ]
 
-  # TensorBoard integration (optional)
   tensorboard = None
   if _TENSORBOARD.value or _TENSORBOARD_GCS_PATH.value:
     tensorboard = xm_local.TensorboardCapability(
@@ -159,11 +152,11 @@ def main(_):
         base_output_directory=_TENSORBOARD_GCS_PATH.value,
     )
 
-
-  # Create executor
   executor = xm_local.VertexTrainingCluster(
       cluster_type=_CLUSTER_TYPE.value,
       partition=_PARTITION.value,
+      account=_ACCOUNT.value,
+      time_limit=_TIME_LIMIT.value,
       requirements=xm.JobRequirements(replicas=_NODES.value),
       login_node=_LOGIN_NODE.value,
       use_gcloud_ssh=_USE_GCLOUD_SSH.value,
@@ -174,42 +167,36 @@ def main(_):
       container_env_passthrough=container_env_passthrough,
       setup_jax_coordinator=True,
       env_vars=env_vars,
-      stream_output=True,
+      stream_output=_STREAM_OUTPUT.value,
       tensorboard=tensorboard,
       tensorboard_region=_TENSORBOARD_REGION.value,
       tensorboard_project=_TENSORBOARD_PROJECT.value,
   )
 
-  # Print config
   config = executor.get_cluster_config()
-  print(f'\n{"="*60}')
-  print(f'MaxText + Vizier Integration Test')
-  print(f'{"="*60}')
-  print(f'Cluster: {config.cluster_type} ({config.gpu_type})')
+  print(f'\nCluster: {config.cluster_type} ({config.gpu_type})')
   print(f'Nodes: {_NODES.value} ({_NODES.value * config.gpus_per_node} GPUs)')
   print(f'GCS: gs://{_GCS_BUCKET.value}/')
-  print(f'Vizier: {_NUM_TRIALS.value} trials, metric={_METRIC.value}')
-  print(f'{"="*60}\n')
+  print(f'Vizier: {_NUM_TRIALS.value} trials, {_NUM_PARALLEL.value} parallel, metric={_METRIC.value}')
+  if tensorboard:
+    print(f'TensorBoard: {_TENSORBOARD.value} ({_TENSORBOARD_REGION.value})')
 
   if _DRY_RUN.value:
     print('[DRY RUN] Config validated, not submitting')
     return
 
-  # Build training args
-  # When VMDS TensorBoard is configured, $AIP_TENSORBOARD_LOG_DIR is set by
-  # the runtime. MaxText writes TB logs there, and Vizier discovers the path
-  # via GCS blob listing -- no hardcoded path pattern needed.
+  maxtext_args = [
+      f'steps={_STEPS.value}',
+      f'base_output_directory=gs://{_GCS_BUCKET.value}',
+      'tensorboard_dir=${AIP_TENSORBOARD_LOG_DIR}',
+      'run_name=job-${SLURM_JOB_ID}',
+      'packing=False',
+  ]
   training_args = [
       'src/MaxText/train.py',
       _CONFIG_FILE.value,
-      xm.ShellSafeArg(f'steps={_STEPS.value}'),
-      xm.ShellSafeArg(f'base_output_directory=gs://{_GCS_BUCKET.value}'),
-      xm.ShellSafeArg('tensorboard_dir=${AIP_TENSORBOARD_LOG_DIR}'),
-      xm.ShellSafeArg('run_name=job-${SLURM_JOB_ID}'),
-      xm.ShellSafeArg('packing=False'),
-  ]
+  ] + [xm.ShellSafeArg(a) for a in maxtext_args]
 
-  # Vizier study spec
   study_spec = aip.StudySpec(
       algorithm=aip.StudySpec.Algorithm.ALGORITHM_UNSPECIFIED,
       parameters=[
@@ -239,7 +226,6 @@ def main(_):
       ],
   )
 
-  # Run experiment
   with xm_local.create_experiment(
       experiment_title=f'maxtext_vizier_{timestamp}'
   ) as experiment:
@@ -260,14 +246,12 @@ def main(_):
         ),
         num_trials_total=_NUM_TRIALS.value,
         num_parallel_trial_runs=_NUM_PARALLEL.value,
-        # Multi-metric support: fetch both metrics defined in study_spec
         metric_names=[_METRIC.value, 'perf/per_device_tflops_per_sec'],
         gcs_log_base=f'gs://{_GCS_BUCKET.value}',
     )
 
     print('Starting Vizier study...')
-    print(f'Monitor jobs: squeue --me')
-    print(f'Vizier console: https://console.cloud.google.com/vertex-ai/experiments')
+    print('Monitor jobs: squeue --me')
 
     exploration.launch(poll_frequency_in_sec=60)
 

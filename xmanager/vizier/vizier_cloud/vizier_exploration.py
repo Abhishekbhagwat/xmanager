@@ -14,7 +14,7 @@
 """Interface for launching Vizier Explorations using Vertex Vizier."""
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from xmanager import xm
 from xmanager.vizier.vizier_cloud import study_factory as sf
@@ -56,10 +56,8 @@ class VizierExploration:
       num_trials_total: int,
       num_parallel_trial_runs: int,
       # GCS metric fetching parameters (for VTC jobs)
-      metric_name: Optional[str] = None,
+      metric_names: Optional[Union[str, List[str]]] = None,
       gcs_log_base: Optional[str] = None,
-      cluster_id: Optional[str] = None,
-      tensorboard_path_fn: Optional[Callable[[str, str], str]] = None,
       param_to_arg_fn: Optional[Callable[[str, Any], str]] = None,
   ) -> None:
     """Create a VizierExploration.
@@ -70,26 +68,28 @@ class VizierExploration:
       study_factory: the VizierStudyFactory used to create or load the study.
       num_trials_total: total number of trials the experiment want to explore.
       num_parallel_trial_runs: number of parallel runs evaluating the trials.
-      metric_name: Name of the metric to extract from TensorBoard logs (e.g.,
-        'reduced_train_loss'). If provided along with gcs_log_base, enables
-        GCS-based metric fetching for VTC jobs.
+      metric_names: Name(s) of the metric(s) to extract from TensorBoard logs.
+        Can be a single string for backward compatibility (e.g.,
+        'reduced_train_loss') or a list for multi-objective optimization (e.g.,
+        ['learning/loss', 'perf/per_device_tflops_per_sec']). If provided along
+        with gcs_log_base, enables GCS-based metric fetching for VTC jobs.
       gcs_log_base: Base GCS path for TensorBoard logs (e.g.,
-        'gs://my-bucket'). Used with tensorboard_path_fn to construct full path.
-      cluster_id: Cluster identifier for constructing GCS paths (NeMo pattern).
-      tensorboard_path_fn: Optional function to construct the tensorboard path.
-        Takes (gcs_log_base, slurm_job_id) and returns the full GCS path.
-        Defaults to NeMo pattern if cluster_id provided, MaxText pattern otherwise.
-        Example for MaxText: lambda base, job_id: f'{base}/job-{job_id}/tensorboard/job-{job_id}/'
-        Example for NeMo: lambda base, job_id: f'{base}/{cluster_id}/tensorboard/job-{job_id}/'
+        'gs://my-bucket'). The actual tensorboard directory is discovered
+        automatically via GCS blob listing, so this works with any framework
+        (MaxText, NeMo, etc.) regardless of directory structure.
       param_to_arg_fn: Optional function to convert Vizier parameter (name,
         value) pairs to command-line argument strings. Defaults to
         '{name}={value}' format. Use this for NeMo-style args like
         'data.micro_batch_size=4'.
     """
-    self._metric_name = metric_name
+    # Normalize metric_names to list for internal handling
+    if metric_names is None:
+      self._metric_names = None
+    elif isinstance(metric_names, str):
+      self._metric_names = [metric_names]
+    else:
+      self._metric_names = list(metric_names)
     self._gcs_log_base = gcs_log_base
-    self._cluster_id = cluster_id
-    self._tensorboard_path_fn = tensorboard_path_fn
     self._param_to_arg_fn = param_to_arg_fn or (lambda n, v: f'{n}={v}')
 
     async def work_unit_generator(
@@ -102,10 +102,10 @@ class VizierExploration:
 
     # Create metric fetcher if GCS parameters are provided
     metric_fetcher = None
-    metric_id = None
-    if metric_name and gcs_log_base:
+    metric_ids = None
+    if self._metric_names and gcs_log_base:
       metric_fetcher = self._create_metric_fetcher()
-      metric_id = metric_name
+      metric_ids = self._metric_names
 
     self._controller = vizier_controller.VizierController(
         experiment,
@@ -115,24 +115,30 @@ class VizierExploration:
         num_trials_total,
         num_parallel_trial_runs,
         metric_fetcher=metric_fetcher,
-        metric_id=metric_id,
+        metric_ids=metric_ids,
     )
 
   def _create_metric_fetcher(
       self,
-  ) -> Callable[[xm.WorkUnit], Optional[List[Tuple[int, float]]]]:
+  ) -> Callable[[xm.WorkUnit], Optional[List[Tuple[int, Dict[str, float]]]]]:
     """Create a metric fetcher function for GCS-based metric reading.
 
+    Uses GCS discovery to find TensorBoard log directories automatically,
+    regardless of the framework-specific directory structure. Caches
+    GCSMetricReader instances per slurm_job_id so that _last_step_reported
+    is preserved across polls (only new metrics are returned each cycle).
+
     Returns:
-      A callable that takes a WorkUnit and returns a list of (step, value)
-      tuples, or None if no metrics are found.
+      A callable that takes a WorkUnit and returns a list of
+      (step, metrics_dict) tuples, or None if no metrics are found.
     """
     from xmanager.vizier.vizier_cloud import gcs_metric_reader
 
+    _readers = {}  # Cache: slurm_job_id -> GCSMetricReader
+
     def fetch_metrics(
         work_unit: xm.WorkUnit,
-    ) -> Optional[List[Tuple[int, float]]]:
-      # Get Slurm job ID from work unit handles
+    ) -> Optional[List[Tuple[int, Dict[str, float]]]]:
       slurm_job_id = _get_slurm_job_id(work_unit)
       if not slurm_job_id:
         logging.warning(
@@ -142,31 +148,26 @@ class VizierExploration:
         )
         return None
 
-      # Construct GCS path using custom function or default patterns
-      if self._tensorboard_path_fn:
-        gcs_path = self._tensorboard_path_fn(self._gcs_log_base, slurm_job_id)
-      elif self._cluster_id:
-        # NeMo pattern: {gcs_log_base}/{cluster_id}/tensorboard/job-{slurm_job_id}/
-        gcs_path = (
-            f'{self._gcs_log_base}/{self._cluster_id}/'
-            f'tensorboard/job-{slurm_job_id}/'
+      if slurm_job_id not in _readers:
+        # Discover TB path via GCS search (framework-agnostic)
+        gcs_path = gcs_metric_reader.GCSMetricReader.discover_tensorboard_path(
+            self._gcs_log_base, slurm_job_id
         )
-      else:
-        # MaxText pattern: {gcs_log_base}/job-{slurm_job_id}/tensorboard/job-{slurm_job_id}/
-        gcs_path = (
-            f'{self._gcs_log_base}/job-{slurm_job_id}/'
-            f'tensorboard/job-{slurm_job_id}/'
+        if not gcs_path:
+          logging.warning(
+              'No TB logs found for job %s under %s',
+              slurm_job_id,
+              self._gcs_log_base,
+          )
+          return None
+
+        logging.info('Discovered TB path: %s', gcs_path)
+        _readers[slurm_job_id] = gcs_metric_reader.GCSMetricReader(
+            gcs_path=gcs_path,
+            metric_names=self._metric_names,
         )
 
-      logging.info('Fetching metrics from: %s', gcs_path)
-
-      reader = gcs_metric_reader.GCSMetricReader(
-          gcs_path=gcs_path,
-          metric_name=self._metric_name,
-      )
-
-      # Get all metrics (for full measurement history)
-      metrics = reader.get_all_metrics()
+      metrics = _readers[slurm_job_id].get_new_metrics()
       return metrics if metrics else None
 
     return fetch_metrics

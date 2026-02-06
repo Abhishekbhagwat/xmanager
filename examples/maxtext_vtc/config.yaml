@@ -1,95 +1,3 @@
-# # MaxText Gemma3-27B Configuration for Vertex Training Cluster
-# # This is an example configuration for running gemma3-27B pretraining on VTC.
-# #
-# # Usage with XManager launcher:
-# #   xmanager launch examples/maxtext_vtc/launcher.py -- \
-# #     --config_file=/mnt/jobs/gemma3-27b.yaml \
-# #     --gcs_bucket=my-bucket \
-# #     --nodes=2 \
-# #     --steps=1000
-# #
-# # Command-line overrides (from launcher) take precedence over this file.
-
-# # =============================================================================
-# # Model Configuration
-# # =============================================================================
-# base_config: "base.yml"
-# model_name: gemma3-27b
-
-# # =============================================================================
-# # Hardware and Parallelism
-# # =============================================================================
-# hardware: gpu_multiprocess
-
-# # Data parallelism across nodes (DCN = data center network)
-# dcn_data_parallelism: 1
-# dcn_fsdp_parallelism: 2    # Increase for more nodes (e.g., 4 for 4 nodes)
-
-# # Intra-node parallelism (ICI = inter-chip interconnect)
-# ici_fsdp_parallelism: 8     # 8 GPUs per node
-
-# # =============================================================================
-# # Training Configuration
-# # =============================================================================
-# per_device_batch_size: 5
-# max_target_length: 8192
-# learning_rate: 0.001        # Tunable via Vizier: --vizier_param=learning_rate:double:1e-5:1e-3:log
-
-# # =============================================================================
-# # Checkpointing
-# # =============================================================================
-# enable_checkpointing: true
-# checkpoint_period: 100
-# async_checkpointing: false
-# save_checkpoint_on_completion: true
-# tensorboard_dir: gs://ai-infra-gcs-europe-west4
-
-# # =============================================================================
-# # Model Architecture
-# # =============================================================================
-# attention: cudnn_flash_te
-# remat_policy: full
-# use_iota_embed: true
-# logits_dot_in_fp32: false
-# scan_layers: true
-
-# # =============================================================================
-# # Monitoring
-# # =============================================================================
-# enable_goodput_recording: false
-# monitor_goodput: false
-# save_config_to_gcs: true
-
-# # =============================================================================
-# # Dataset Configuration
-# # =============================================================================
-# # Option 1: Synthetic data (for testing)
-# # dataset_type: synthetic
-
-# # Option 2: C4 dataset from GCS
-# dataset_path: gs://maxtext-dataset        # Update to your GCS bucket
-# dataset_type: tfds
-# dataset_name: c4/en:3.0.1
-# train_split: train
-# eval_split: validation
-# eval_tokens: 60000
-# add_bos: false
-# add_eos: false
-
-# # =============================================================================
-# # Vizier-Tunable Parameters (examples)
-# # =============================================================================
-# # These parameters can be overridden via Vizier optimization:
-# #
-# # --vizier_param=learning_rate:double:1e-5:1e-3:log
-# # --vizier_param=per_device_batch_size:int:1:8
-# # --vizier_param=dcn_fsdp_parallelism:int:1:4
-# # --vizier_param=max_target_length:int:2048:8192
-# #
-# # The launcher appends these as CLI args: learning_rate=0.0002 per_device_batch_size=4
-# # CLI args override values in this config file.
-
-
 # Copyright 2024 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -109,7 +17,7 @@ model_name: llama3.1-70b
 
 hardware: gpu_multiprocess
 dcn_data_parallelism: 1
-dcn_fsdp_parallelism: 2
+dcn_fsdp_parallelism: 4
 ici_fsdp_parallelism: 8
 per_device_batch_size: 1
 max_target_length: 8192
